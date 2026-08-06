@@ -100,7 +100,8 @@ def _resolved(paths: dict, key: str) -> str:
         return ""
     p = Path(val)
     if not p.is_absolute():
-        p = Path(paths["_base"]) / p
+        base = paths.get("_base") or Path(__file__).resolve().parent.parent
+        p = base / p
     return str(p.resolve())
 
 

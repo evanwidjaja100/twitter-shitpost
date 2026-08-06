@@ -1,5 +1,4 @@
 playwright>=1.60
-praw>=8.0
 google-api-python-client>=2.190
 yt-dlp>=2026.1.1
 python-dotenv>=1.0

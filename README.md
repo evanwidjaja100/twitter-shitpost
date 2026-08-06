@@ -1,6 +1,6 @@
 # Average Pocka — X Shitpost Bot
 
-$0 shitposting bot: scrapes Reddit, YouTube, and X for top content, reposts to
+$0 shitposting bot: scrapes TikTok, YouTube, and X for top content, reposts to
 X via a real Brave browser (Playwright). Everything lives on drive D.
 
 ## Quick start
@@ -24,16 +24,27 @@ X via a real Brave browser (Playwright). Everything lives on drive D.
 
 | Key | Where to get it | Cost |
 |---|---|---|
-| `reddit_client_id` / `reddit_client_secret` | reddit.com/prefs/apps → *create another app* → **script** type | $0 |
 | `youtube_api_key` | console.cloud.google.com → enable *YouTube Data API v3* → API key | $0 |
 
+TikTok needs **no credentials and no accounts** — the bot scrapes the general
+"For You" feed with its own browser automatically (no API, so there's nothing
+for TikTok to reject). To make it niche instead, optionally add gaming `@handles`
+under `tiktok.accounts`. Either way, no key needed.
+
+YouTube works the same now: set `youtube.shorts_feed: true` (default) to scrape
+the Shorts feed automatically with no API key. Only if you want specific
+channels' full videos do you need `youtube_api_key` + `youtube.channels`.
+
 Without credentials the bot still works but only posts demo/test content —
-Reddit + YouTube scraping unlock with these.
+YouTube scraping unlocks with the API key, and TikTok unlocks as soon as you
+add accounts (no key needed).
 
 ## Configure sources (`config.json`)
 
-- `reddit.subreddits` — list of meme subreddits to pull from
-- `youtube.channels` — list of `{name, handle: "@channel"}` to pull clips from
+- `tiktok.foryou` — `true` (default) = auto-scrape the general TikTok feed; `false` = scrape only your curated accounts below
+- `tiktok.accounts` — optional list of gaming TikTok @handles (used when `foryou` is `false`, or in addition)
+- `youtube.shorts_feed` — `true` (default) = auto-scrape the YouTube Shorts feed (no API key); `false` = use only the configured channels below
+- `youtube.channels` — optional list of `{name, handle: "@channel"}` to pull clips from (needs `youtube_api_key`)
 - `x_sources.accounts` — X accounts to scrape (e.g. `["@memelord", ...]`)
 - `posting.min/max_posts_per_day` — daily volume (default 3-6)
 - `filters.blocked_keywords` — content never posted
@@ -54,15 +65,16 @@ python main.py --dry-run --seed-demo   offline end-to-end test, no posting
 
 ## Niche: gaming feed
 
-The bot is configured to pull gaming memes (`r/gamingmemes`, `r/gamermemes`,
-`r/okbuddygaming`, `r/pcmasterrace`, `r/MinecraftMemes`, `r/gaming`, `r/Steam`,
-`r/gamingcirclejerk`) and post between 16:00 and 01:00 (gaming peak hours,
-spans midnight — supported by the scheduler).
+The bot is configured to pull gaming content from curated TikTok @handles (and
+YouTube channels) for the gaming niche and posts between 16:00 and 01:00 (gaming
+peak hours, spans midnight — supported by the scheduler).
 
 To add more sources:
-- **Reddit**: add subreddit names to `reddit.subreddits`
-- **YouTube**: add `{"name": "...", "handle": "@channel", "playlist_id": ""}`
-  to `youtube.channels` — set the handle OR the uploads playlist id
+- **TikTok**: leave `tiktok.foryou: true` to scrape the whole feed automatically,
+  or add gaming `@handles` to `tiktok.accounts` for curated picks
+- **YouTube**: leave `youtube.shorts_feed: true` to auto-scrape Shorts; or add
+  `{"name": "...", "handle": "@channel", "playlist_id": ""}` to
+  `youtube.channels` (needs `youtube_api_key`) for full videos
 - **X**: add gaming shitpost account handles to `x_sources.accounts`
 
 ## Follower tracking

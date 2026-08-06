@@ -93,11 +93,7 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
     try:
         if item["kind"] == "image":
             out = m.prepare_image(src, str(src_dir), cfg["posting"]["max_image_bytes"])
-            if not image_passes_dims(
-                out,
-                cfg["reddit"].get("min_image_width", 0),
-                cfg["reddit"].get("min_image_height", 0),
-            ):
+            if not image_passes_dims(out, 0, 0):
                 return None
             return out
         else:  # video
@@ -127,17 +123,13 @@ def pick_item(cfg: dict, db, session=None, commit: bool = True) -> dict | None:
     blocked = cfg["filters"]["blocked_keywords"]
     items: list[dict] = []
 
-    if secrets.get("reddit_client_id"):
-        import praw
+    tiktok = cfg.get("tiktok", {})
+    if (tiktok.get("foryou") or tiktok.get("accounts")) and session is not None:
+        from scrapers import tiktok_scraper
 
-        reddit = praw.Reddit(
-            client_id=secrets["reddit_client_id"],
-            client_secret=secrets["reddit_client_secret"],
-            user_agent=secrets["reddit_user_agent"],
+        items += tiktok_scraper.scrape(
+            session, tiktok, str(BASE / cfg["paths"]["assets_dir"])
         )
-        from scrapers import reddit_scraper
-
-        items += reddit_scraper.scrape(reddit, cfg["reddit"])
 
     if secrets.get("youtube_api_key"):
         from googleapiclient.discovery import build
@@ -146,6 +138,11 @@ def pick_item(cfg: dict, db, session=None, commit: bool = True) -> dict | None:
         from scrapers import youtube_scraper
 
         items += youtube_scraper.scrape(yt, cfg["youtube"])
+
+    if cfg.get("youtube", {}).get("shorts_feed") and session is not None:
+        from scrapers import youtube_scraper
+
+        items += youtube_scraper.scrape_shorts(session, cfg["youtube"])
 
     if cfg["x_sources"].get("accounts") and session is not None:
         from scrapers import x_scraper
@@ -200,10 +197,17 @@ def cmd_login():
 
 
 def cmd_sources(cfg):
+    from publisher.x_publisher import XSession
+
     db = _make_db(cfg)
-    result = pick_item(cfg, db, commit=False)
+    session = XSession(cfg["paths"])
+    session.start()
+    try:
+        result = pick_item(cfg, db, session, commit=False)
+    finally:
+        session.stop()
     if result is None:
-        print("No postable item right now (no credentials, or everything already posted).")
+        print("No postable item right now (no accounts configured, or everything already posted).")
         return
     print(f"Top pick: [{result['source']}] score={result['score']:.0f}")
     print(f"  title : {result.get('title', '')[:80]}")
@@ -350,7 +354,7 @@ def cmd_selftest(cfg) -> int:
             ok = False
 
     check("python>=3.10", sys.version_info >= (3, 10), sys.version.split()[0])
-    for mod in ("playwright", "praw", "googleapiclient", "yt_dlp", "PIL", "requests"):
+    for mod in ("playwright", "googleapiclient", "yt_dlp", "PIL", "requests"):
         try:
             __import__(mod)
             check(f"import {mod}", True)

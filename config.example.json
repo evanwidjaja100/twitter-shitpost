@@ -27,30 +27,21 @@
       "this aged well"
     ]
   },
-  "reddit": {
-    "subreddits": [
-      "gamingmemes",
-      "gamermemes",
-      "okbuddygaming",
-      "pcmasterrace",
-      "MinecraftMemes",
-      "gaming",
-      "Steam",
-      "gamingcirclejerk"
-    ],
-    "limit_per_subreddit": 25,
-    "min_score": 1500,
-    "block_nsfw": true,
-    "min_image_width": 500,
-    "min_image_height": 400
+  "tiktok": {
+    "foryou": true,
+    "accounts": [],
+    "max_posts_per_account": 10,
+    "min_likes": 50000,
+    "scrolls": 3
   },
   "youtube": {
+    "shorts_feed": true,
     "channels": [
       { "name": "videogamedunkey", "handle": "@videogamedunkey", "playlist_id": "" },
       { "name": "your_gaming_channel_2", "handle": "@add_here", "playlist_id": "" }
     ],
     "max_items_per_channel": 10,
-    "min_views": 100000,
+    "min_views": 10000,
     "max_age_days": 21,
     "clip_max_seconds": 60,
     "clip_min_seconds": 8,
@@ -79,9 +70,6 @@
     ]
   },
   "secrets": {
-    "reddit_client_id": "",
-    "reddit_client_secret": "",
-    "reddit_user_agent": "windows:average_pocka_bot:v1.0 (personal use)",
     "youtube_api_key": ""
   },
   "safety": {
