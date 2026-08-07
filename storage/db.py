@@ -74,15 +74,28 @@ class Database:
             )
             self._conn.commit()
 
-    def is_hash_seen(self, content_hash: str, cooldown_days: int) -> bool:
-        cutoff = time.time() - cooldown_days * 86400
+    def is_hash_seen(self, content_hash: str, cooldown_days: int, now_ts: float | None = None) -> bool:
+        """Whether `content_hash` is within its repost cooldown.
+
+        The cooldown is measured from `last_seen` (the most recent successful
+        publication of this media), NOT from `first_seen` — otherwise a repost
+        after the first expiry would never restart the cooldown. `first_seen`
+        is used only as a compatibility fallback for rows written by older
+        schema versions where `last_seen` could be NULL. `now_ts` defaults to
+        the real clock for backward compatibility; tests inject a fixed epoch.
+        """
+        now = time.time() if now_ts is None else float(now_ts)
+        cutoff = now - cooldown_days * 86400
         with self._lock:
             row = self._conn.execute(
-                "SELECT first_seen, post_count FROM hashes WHERE hash = ?", (content_hash,)
+                "SELECT first_seen, last_seen FROM hashes WHERE hash = ?", (content_hash,)
             ).fetchone()
             if row is None:
                 return False
-            return row["first_seen"] >= cutoff
+            seen_at = row["last_seen"]
+            if seen_at is None:
+                seen_at = row["first_seen"]
+            return seen_at >= cutoff
 
     def record_hash(self, content_hash: str, source: str, source_url: str):
         now = time.time()
