@@ -368,6 +368,105 @@ class TestDaemonRecovery:
         assert len(rec.sessions) == 3
         assert sleep.call_count == 2   # backoff after the first and third failure
 
+    # -- A1/A2: alert failures never interfere with recovery --------------
+
+    def test_alert_failure_does_not_block_retry(self, tmp_path):
+        """A1: primary failure + alert failure -> retry still occurs. The
+        supervisor must swallow a secondary alert() exception (disk full,
+        unwritable logs dir, ...) and proceed with the bounded backoff, so a
+        diagnostic failure can never kill recovery."""
+        cfg = _daemon_cfg(tmp_path, max_daemon_restarts=2)
+        db = Database(str(cfg["paths"]["db_file"]))
+        rec = SessionRecorder()
+        count = {"n": 0}
+        sleep = mock.MagicMock()
+
+        def iteration_work(c, d, ses):
+            count["n"] += 1
+            if count["n"] == 1:
+                raise RuntimeError("boom during fanout")
+            raise _LoopEnd()
+
+        def failing_alert(cfg, message):
+            raise OSError("disk full: cannot write alerts.log")
+
+        with mock.patch("publisher.x_publisher.XSession", new=rec.factory()), \
+                mock.patch("main._make_db", return_value=db), \
+                mock.patch("main._daemon_iteration", side_effect=iteration_work), \
+                mock.patch("main.time.sleep", sleep), \
+                mock.patch("main.alert", side_effect=failing_alert):
+            with pytest.raises(_LoopEnd):
+                main.supervise_daemon(cfg)
+
+        assert len(rec.sessions) == 2                 # retry happened
+        assert rec.sessions[1].start.call_count == 1  # fresh session started
+        assert sleep.call_count == 1                  # backoff still ran
+
+    def test_alert_failure_does_not_mask_original_exception(self, tmp_path, caplog):
+        """A2: retry exhaustion + alert failure -> the *original* daemon
+        exception escalates (process exits non-zero), not the alert's OSError,
+        and the alert failure is logged as a diagnostic."""
+        cfg = _daemon_cfg(tmp_path, max_daemon_restarts=1)
+        rec = SessionRecorder()
+        sleep = mock.MagicMock()
+        original = RuntimeError("primary crash, must surface")
+
+        def always_crash(c, d, s):
+            raise original
+
+        def failing_alert(cfg, message):
+            raise OSError("cannot write alerts.log")
+
+        with mock.patch("publisher.x_publisher.XSession", new=rec.factory()), \
+                mock.patch("main._make_db", return_value=Database(str(cfg["paths"]["db_file"]))), \
+                mock.patch("main._daemon_iteration", side_effect=always_crash), \
+                mock.patch("main.time.sleep", sleep), \
+                mock.patch("main.alert", side_effect=failing_alert):
+            with pytest.raises(RuntimeError) as exc_info:
+                main.supervise_daemon(cfg)
+
+        assert exc_info.value is original            # primary exception survives
+        assert "primary crash" in str(exc_info.value)
+        assert sleep.call_count == 0                 # escalation: no backoff sleep
+
+    # -- A3: the helper succeeds for a recoverable alert failure -----------
+
+    def test_best_effort_alert_logs_failure_but_returns(self, tmp_path, caplog):
+        """A3: _best_effort_alert swallows the alert failure (so callers never
+        raise) and records a diagnostic warning."""
+        failing = mock.MagicMock(side_effect=OSError("disk full"))
+        with mock.patch("main.alert", failing):
+            ret = main._best_effort_alert(_daemon_cfg(tmp_path), "op warning")
+        assert ret is None                            # never raises
+        warn = [r for r in caplog.records if "failed to send" in r.getMessage()]
+        assert warn and "op warning" in warn[-1].getMessage()
+        assert warn[-1].exc_info is not None          # underlying OSError logged
+
+    def test_alert_failure_does_not_affect_intentional_stop(self, tmp_path):
+        """the intentional login/captcha stop also uses the helper: an alert
+        failure there must not turn a planned clean shutdown into a crash"""
+        cfg = _daemon_cfg(tmp_path)
+        rec = SessionRecorder()
+        sleep = mock.MagicMock()
+
+        def failing_alert(cfg, message):
+            raise OSError("cannot write alerts.log")
+
+        with mock.patch("publisher.x_publisher.XSession", new=rec.factory()), \
+                mock.patch("main._make_db", return_value=Database(str(cfg["paths"]["db_file"]))), \
+                mock.patch("tracker.maybe_check_followers"), \
+                mock.patch("scheduler.remaining_slots", return_value=[9999999999.0]), \
+                mock.patch("scheduler.sleep_until"), \
+                mock.patch("main.attempt_slot",
+                           return_value={"outcome": "failed", "reason": "captcha"}), \
+                mock.patch("main.time.sleep", sleep), \
+                mock.patch("main.alert", side_effect=failing_alert):
+            main.supervise_daemon(cfg)   # returns cleanly, no exception
+
+        assert not sleep.called           # no recovery backoff
+        assert len(rec.sessions) == 1     # one session, cleanly stopped
+        assert rec.sessions[0].stop.call_count == 1
+
     # -- I: publishing lock stays held during recovery --------------------
 
     def test_publish_lock_held_across_internal_restart(self, tmp_path):

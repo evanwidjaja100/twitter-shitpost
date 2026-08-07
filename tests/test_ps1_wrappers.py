@@ -1,15 +1,21 @@
-"""Static/safe validation of the PowerShell deployment scripts (Issue 1 part 2).
+"""Safe, value-based validation of the PowerShell deployment scripts.
 
-* ``run_bot.ps1`` must propagate the Python daemon's real exit code so callers
-  / Task Scheduler can distinguish an intentional successful stop (0) from an
+* ``run_bot.ps1`` must propagate the Python daemon's real exit code so callers /
+  Task Scheduler can distinguish an intentional successful stop (0) from an
   unrecovered crash (non-zero).
-* ``setup_task.ps1`` must configure restart-on-failure (RestartCount /
-  RestartInterval) and avoid overlapping scheduled instances
-  (MultipleInstances = IgnoreNew) using the ScheduledTasks cmdlets.
+* ``setup_task.ps1`` must build a *valid* Scheduled Task action:
+    Execute   = cmd.exe
+    Arguments = /c "<pythonw>" "<main.py>" daemon >> "<out>" 2>> "<err>"
+  i.e. the arguments begin with cmd.exe's own ``/c`` switch, never with a
+  redundant ``cmd /c`` (which would have Windows try to run
+  ``cmd.exe cmd /c ...`` — cmd treats the second ``cmd`` as a program and the
+  daemon never starts). Restart-on-failure and multiple-instance suppression
+  must remain configured.
 
-Nothing here registers or modifies the real scheduled task, and nothing runs a
-daemon. Only the propagation pattern is executed, against a harmless
-``sys.exit`` stub, in a real PowerShell.
+Nothing here registers or modifies the real scheduled task and nothing runs a
+daemon. The construction functions are dot-sourced from ``setup_task.ps1`` with
+``-SkipRegister`` and the real ``New-ScheduledTaskAction``/``New-
+ScheduledTaskSettingsSet`` cmdlets are invoked to prove the produced values.
 """
 
 import shutil
@@ -54,6 +60,35 @@ def _parse_ok(path: Path) -> bool:
     return res.returncode == 0, res.stdout + res.stderr
 
 
+@staticmethod
+def _action_snapshot():
+    """Dot-source setup_task.ps1 (-SkipRegister) and sniff the real action and
+    settings objects. Returns dict of field -> value (or list/ints)."""
+    script = str(SETUP_TASK).replace("'", "''")
+    base = str(ROOT).replace("'", "''")
+    code = f"""
+. '{script}' -SkipRegister
+$a = New-BotScheduledTaskAction -BasePath '{base}'
+$s = New-BotScheduledTaskSettings
+"EXECUTE=" + $a.Execute
+"ARGUMENTS=" + $a.Arguments
+"RESTART_COUNT=" + $s.RestartCount
+$minutes = 0
+if ($s.RestartInterval -match 'PT(\\d+)M') {{ $minutes = [int]$Matches[1] }}
+"RESTART_INTERVAL=" + $minutes
+"MULTIPLE_INSTANCES=" + $s.MultipleInstances.ToString()
+"""
+    res = _run_ps(["-Command", code])
+    if res.returncode != 0:
+        return None, res.stdout + res.stderr
+    snap = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            snap[k.strip()] = v.strip()
+    return snap, ""
+
+
 @pytest.mark.parametrize("script", [RUN_BOT, SETUP_TASK])
 def test_powershell_scripts_parse(script):
     ok, detail = _parse_ok(script)
@@ -81,18 +116,49 @@ def test_run_bot_propagation_pattern_works(tmp_path):
     assert res.returncode == 42, res.stdout + res.stderr
 
 
-def test_setup_task_has_restart_and_single_instance_settings():
-    text = SETUP_TASK.read_text(encoding="utf-8")
-    assert "-RestartCount" in text
-    assert "-RestartInterval" in text
-    assert "IgnoreNew" in text            # MultipleInstances = IgnoreNew
-    assert "Register-ScheduledTask" in text
-    assert "New-ScheduledTaskSettingsSet" in text
+def test_setup_action_execute_is_cmd_and_args_start_with_slash_c():
+    """B1/B2/B4: Execute == cmd.exe and Arguments begin with cmd.exe's own
+    /c switch (never with a redundant 'cmd /c')."""
+    snap, err = _action_snapshot()
+    assert snap is not None, f"snapshot failed:\n{err}"
+    assert snap["EXECUTE"] == "cmd.exe"
+    args = snap["ARGUMENTS"]
+    assert args.startswith("/c"), f"'cmd /c' leaked into Arguments: {args!r}"
+    assert not args.startswith("cmd"), args
 
 
-def test_setup_task_preserves_exit_code_path():
-    """The task action must run the daemon through a wrapper that propagates
-    the exit code (cmd /c returns the inner command's code)."""
-    text = SETUP_TASK.read_text(encoding="utf-8")
-    assert "cmd /c" in text
-    assert "daemon" in text
+def test_setup_action_contains_python_daemon_command():
+    """B4/B5: the Arguments carry the Python daemon invocation."""
+    snap, err = _action_snapshot()
+    assert snap is not None, f"snapshot failed:\n{err}"
+    args = snap["ARGUMENTS"]
+    assert "pythonw.exe" in args.lower() or "python.exe" in args.lower()
+    assert "main.py" in args
+    assert " daemon" in args
+
+
+def test_setup_action_quotes_paths_with_spaces():
+    """B6: any path containing spaces (the repo path does) is quoted."""
+    snap, err = _action_snapshot()
+    assert snap is not None, f"snapshot failed:\n{err}"
+    args = snap["ARGUMENTS"]
+    assert "\\test\\twitter shitpost\\main.py" in args
+    assert args.count('"') >= 4  # python + script + stdout + stderr paths quoted
+
+
+def test_setup_action_keeps_output_redirection():
+    """B7: stdout/stderr redirection to per-output logs survives."""
+    snap, err = _action_snapshot()
+    assert snap is not None, f"snapshot failed:\n{err}"
+    args = snap["ARGUMENTS"]
+    assert ">>" in args and "2>>" in args
+    assert "daemon_out.log" in args and "daemon_err.log" in args
+
+
+def test_setup_settings_restart_and_single_instance():
+    """B8/B9/Task 8: restart-on-failure + duplicate-suppression stay set."""
+    snap, err = _action_snapshot()
+    assert snap is not None, f"snapshot failed:\n{err}"
+    assert int(snap["RESTART_COUNT"]) >= 1
+    assert float(snap["RESTART_INTERVAL"]) >= 5
+    assert snap["MULTIPLE_INSTANCES"].lower() in ("ignorenew", "ignorenonew")

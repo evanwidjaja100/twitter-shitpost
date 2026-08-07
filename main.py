@@ -51,6 +51,24 @@ def alert(cfg: dict, message: str):
     logging.getLogger("alert").error(message)
 
 
+def _best_effort_alert(cfg: dict, message: str, log=None):
+    """Send a diagnostic alert without letting alert failure break recovery.
+
+    The daemon supervisor treats alerts as best-effort diagnostics: if writing
+    the alert itself fails (disk full, unwritable logs dir, permission error,
+    ...) the failure is logged and swallowed so it can never replace the
+    primary daemon exception the supervisor is handling, and recovery/retry
+    logic proceeds normally. Only ordinary ``Exception`` failures of ``alert``
+    are contained — ``KeyboardInterrupt``/``SystemExit`` still propagate.
+    """
+    try:
+        alert(cfg, message)
+    except Exception:
+        (log or logging.getLogger("daemon")).warning(
+            "failed to send daemon alert: %s", message, exc_info=True
+        )
+
+
 # ------------------------------------------------------------- selection
 
 def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
@@ -430,10 +448,10 @@ def supervise_daemon(cfg):
             state["consecutive"] += 1
             n = state["consecutive"]
             log.exception("daemon failed unexpectedly (consecutive failures: %d)", n)
-            alert(cfg, f"daemon crashed unexpectedly (attempt {n}): {exc!r}")
+            _best_effort_alert(cfg, f"daemon crashed unexpectedly (attempt {n}): {exc!r}")
             if n >= max_restarts:
                 log.critical("daemon failed %d consecutive times; giving up", n)
-                alert(cfg, "daemon gave up after repeated unexpected failures")
+                _best_effort_alert(cfg, "daemon gave up after repeated unexpected failures")
                 raise  # non-zero process exit -> outer recovery layer
             delay = min(base_seconds * n, cap_seconds)
             log.warning("restarting daemon in %d seconds (failure %d)", delay, n)
@@ -502,7 +520,7 @@ def _daemon_iteration(cfg, db, session):
         result = attempt_slot(cfg, db, session)
         if result["outcome"] == "failed":
             if result["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
-                alert(cfg, "stopping daemon due to login/captcha failure")
+                _best_effort_alert(cfg, "stopping daemon due to login/captcha failure")
                 raise DaemonStop(result["reason"])
             time.sleep(safety["retry_backoff_minutes"] * 60)
     time.sleep(60)
