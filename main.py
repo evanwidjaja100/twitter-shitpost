@@ -234,27 +234,29 @@ def cmd_sources(cfg):
 
 def cmd_once(cfg):
     from publisher.x_publisher import XSession
+    from publishing_lock import publishing_lock
 
-    db = _make_db(cfg)
-    session = XSession(cfg["paths"])
-    session.start()
-    try:
-        item = pick_item(cfg, db, session)
-        if item is None:
-            alert(cfg, "no item available to post")
-            return
-        res = session.post(item["_caption"], [item["_media_path"]])
-        if res["ok"]:
-            mark_item_published(db, item)
-            logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
-        else:
-            db.add_post(
-                item["_caption"], item["_media_path"], item["source"],
-                item["source_url"], item["_hash"], "failed", res["reason"],
-            )
-            alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
-    finally:
-        session.stop()
+    with publishing_lock(cfg, "once"):
+        db = _make_db(cfg)
+        session = XSession(cfg["paths"])
+        session.start()
+        try:
+            item = pick_item(cfg, db, session)
+            if item is None:
+                alert(cfg, "no item available to post")
+                return
+            res = session.post(item["_caption"], [item["_media_path"]])
+            if res["ok"]:
+                mark_item_published(db, item)
+                logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
+            else:
+                db.add_post(
+                    item["_caption"], item["_media_path"], item["source"],
+                    item["source_url"], item["_hash"], "failed", res["reason"],
+                )
+                alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
+        finally:
+            session.stop()
 
 
 def cmd_stats(cfg, offline: bool):
@@ -344,6 +346,13 @@ def attempt_slot(cfg, db, session, now=None, rng=None) -> dict:
 
 
 def cmd_daemon(cfg):
+    from publishing_lock import publishing_lock
+
+    with publishing_lock(cfg, "daemon"):
+        _run_daemon(cfg)
+
+
+def _run_daemon(cfg):
     from publisher.x_publisher import XSession
     import scheduler
 
