@@ -226,10 +226,16 @@ class Database:
                     pass
                 raise
 
-    def posts_today(self) -> int:
+    def posts_today(self, now_ts: float | None = None) -> int:
+        """Successful posts in the machine-local calendar day of `now_ts`.
+
+        Uses proper local datetime boundaries (calendar day 00:00:00 ->
+        00:00:00 next day), never a UTC/epoch 86400 chunk. `now_ts` defaults to
+        the real clock for backward compatibility; tests inject a fixed epoch.
+        """
         from datetime import datetime
 
-        now = datetime.fromtimestamp(time.time())
+        now = datetime.fromtimestamp(time.time() if now_ts is None else float(now_ts))
         start = datetime(now.year, now.month, now.day, 0, 0, 0).timestamp()
         end = start + 86400
         with self._lock:

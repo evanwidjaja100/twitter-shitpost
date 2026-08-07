@@ -12,6 +12,19 @@ loop iterations and survives daemon restarts. Only the *remaining* slots
 the configured maximum is a real maximum and repeating the scheduling loop can
 never mint another full quota.
 
+Two independent counters are enforced:
+
+* logical posting-window quota: the persisted target minus successful posts
+  recorded inside the current window (the 3-6/day normal mechanism), and
+* local calendar-day absolute cap: `max_daily_posts_absolute` minus successful
+  posts on the machine-local calendar day.
+
+The calendar-day cap is an independent backstop — overnight posts belong to
+the *previous* logical window but to the *current* calendar day, so a window
+may still have room while the day has none. `check_posting_limits()` returns
+both counters separately; `remaining_slots()` and the daemon's pre-post gate
+only ever allow `min(window_room, absolute_room)` posts.
+
 All functions take an explicit `now` and rng so tests are deterministic.
 """
 
@@ -90,6 +103,85 @@ def sample_slots(start, end, now, count, rng=None) -> list[float]:
     return sorted(int(t.timestamp()) for t in chosen)
 
 
+def check_posting_limits(
+    db,
+    min_posts: int,
+    max_posts: int,
+    start_hour: int,
+    end_hour: int,
+    max_absolute=None,
+    now: datetime | None = None,
+    rng=None,
+) -> dict:
+    """Evaluate the two independent quota counters at `now`.
+
+    Returns an info dict separating the logical posting-window count from the
+    local calendar-day absolute count (they are NEVER merged into one counter):
+
+        window_room = target - window_posts          # 3-6/day logical window
+        absolute_room = max_absolute - today_posts    # per-calendar-day backstop
+        remaining   = max(0, min(window_room, absolute_room))
+
+    `window_posts` counts successful posts inside the current logical window.
+    `today_posts` counts successful posts on the machine-local calendar day of
+    `now`, so posts from a previous overnight window still shrink the absolute
+    room correctly. The per-window target is minted once (and persisted) only
+    when a window is currently active.
+
+    `now` defaults to the real clock; `rng` defaults to `random`. The `reason`
+    field is None when posting is allowed, otherwise one of:
+    "window_inactive", "target_reached", "daily_absolute_cap".
+    """
+    now = now or datetime.now()
+    rng = rng or random
+    start = window_start(start_hour, end_hour, now)
+    end = window_end(start, start_hour, end_hour)
+    active = window_active(start, end, now)
+    wid = window_id(start)
+
+    target = db.get_window_target(wid) if active else None
+    if active and target is None:
+        target = int(rng.randint(int(min_posts), int(max_posts)))
+        db.set_window_target(wid, target)
+
+    window_posts = (db.window_post_count(start.timestamp(), end.timestamp())
+                    if active else 0)
+    window_room = max(target - window_posts, 0) if active and target is not None else 0
+
+    today_posts = db.posts_today(now.timestamp())
+    absolute_room = (max(int(max_absolute) - today_posts, 0)
+                     if max_absolute is not None else None)
+
+    remaining = window_room
+    if max_absolute is not None:
+        remaining = min(remaining, absolute_room)
+    remaining = max(remaining, 0)
+
+    if not active:
+        reason = "window_inactive"
+    elif window_room == 0:
+        reason = "target_reached"
+    elif remaining == 0:
+        reason = "daily_absolute_cap"
+    else:
+        reason = None
+
+    return {
+        "allowed": remaining > 0,
+        "remaining": remaining,
+        "reason": reason,
+        "active": active,
+        "window_id": wid,
+        "window_start": start,
+        "window_end": end,
+        "window_posts": window_posts,
+        "target": target,
+        "window_room": window_room,
+        "today_posts": today_posts,
+        "absolute_room": absolute_room,
+    }
+
+
 def remaining_slots(
     db,
     min_posts: int,
@@ -102,32 +194,24 @@ def remaining_slots(
 ) -> list[float]:
     """Future epoch slots still due inside the current posting window.
 
+    Delegates every quota decision to `check_posting_limits()`:
     * identifies the single logical window containing `now`
     * no window is active (e.g. overnight gap after end_hour) -> []
     * the per-window target is chosen once and persisted via `db`
-    * the number of slots returned is target minus successful posts already
-      recorded in that window, additionally clamped by `max_absolute`
+    * returns at most `min(remaining window slots, remaining absolute cap)`
+      and NEVER mints another full quota on repeated calls.
     """
     now = now or datetime.now()
     rng = rng or random
-    start = window_start(start_hour, end_hour, now)
-    end = window_end(start, start_hour, end_hour)
-    if not window_active(start, end, now):
+    state = check_posting_limits(
+        db, min_posts, max_posts, start_hour, end_hour,
+        max_absolute=max_absolute, now=now, rng=rng,
+    )
+    if state["remaining"] <= 0:
         return []
-
-    wid = window_id(start)
-    target = db.get_window_target(wid)
-    if target is None:
-        target = rng.randint(int(min_posts), int(max_posts))
-        db.set_window_target(wid, target)
-
-    posted = db.window_post_count(start.timestamp(), end.timestamp())
-    remaining = target - posted
-    if max_absolute is not None:
-        remaining = min(remaining, int(max_absolute) - posted)
-    if remaining <= 0:
-        return []
-    return sample_slots(start, end, now, remaining, rng)
+    return sample_slots(
+        state["window_start"], state["window_end"], now, state["remaining"], rng
+    )
 
 
 def sleep_until(target_ts: float):

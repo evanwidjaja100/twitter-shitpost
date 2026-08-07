@@ -287,6 +287,62 @@ def cmd_stats(cfg, offline: bool):
     print(f"\nhistory CSV: {csv_path}")
 
 
+def attempt_slot(cfg, db, session, now=None, rng=None) -> dict:
+    """One scheduled-Slot posting attempt, gated by a fresh quota recheck.
+
+    Called by the daemon immediately after `scheduler.sleep_until()` and
+    BEFORE candidate selection / X posting. Slots computed earlier can go
+    stale (another process posts, a manual post happens, a previous scheduled
+    post succeeded, the day or window rolled over, the persisted target was
+    reached...) so this function recomputes `check_posting_limits()` against
+    the live database. If any cap is reached the attempt is vetoed: no item is
+    picked, `session.post()` is never called and no success/dedup state is
+    written.
+
+    Returns a small outcome dict:
+      {"outcome": "vetoed", "reason": "window_inactive"|"target_reached"|"daily_absolute_cap"}
+      {"outcome": "no_item"}
+      {"outcome": "posted", "source_url": ...}
+      {"outcome": "failed", "reason": <publisher reason>}
+    """
+    import scheduler
+
+    posting = cfg["posting"]
+    safety = cfg["safety"]
+    state = scheduler.check_posting_limits(
+        db,
+        posting["min_posts_per_day"],
+        posting["max_posts_per_day"],
+        posting["active_hours_start"],
+        posting["active_hours_end"],
+        max_absolute=safety["max_daily_posts_absolute"],
+        now=now,
+        rng=rng,
+    )
+    if not state["allowed"]:
+        reason = state["reason"] or "limit_reached"
+        logging.getLogger("daemon").info("skipping scheduled slot: %s", reason)
+        return {"outcome": "vetoed", "reason": reason, "state": state}
+
+    item = pick_item(cfg, db, session)
+    if item is None:
+        logging.getLogger("daemon").info("no item found; skipping slot")
+        return {"outcome": "no_item", "state": state}
+
+    res = session.post(item["_caption"], [item["_media_path"]])
+    if res["ok"]:
+        mark_item_published(db, item)
+        logging.getLogger("daemon").info("POSTED: %s", item["source_url"])
+        return {"outcome": "posted", "source_url": item["source_url"], "state": state}
+
+    db.add_post(
+        item["_caption"], item["_media_path"], item["source"],
+        item["source_url"], item["_hash"], "failed", res["reason"],
+    )
+    alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
+    return {"outcome": "failed", "reason": res["reason"], "state": state}
+
+
 def cmd_daemon(cfg):
     from publisher.x_publisher import XSession
     import scheduler
@@ -318,21 +374,11 @@ def cmd_daemon(cfg):
             continue
         for t in times:
             scheduler.sleep_until(t)
-            item = pick_item(cfg, db, session)
-            if item is None:
-                log.info("no item found; skipping slot")
-                continue
-            res = session.post(item["_caption"], [item["_media_path"]])
-            if res["ok"]:
-                mark_item_published(db, item)
-                log.info("POSTED: %s", item["source_url"])
-            else:
-                db.add_post(
-                    item["_caption"], item["_media_path"], item["source"],
-                    item["source_url"], item["_hash"], "failed", res["reason"],
-                )
-                alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
-                if res["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
+            # Fresh quota re-check before any pick/post: precomputed slots are
+            # only an estimate; the DB decides now.
+            result = attempt_slot(cfg, db, session)
+            if result["outcome"] == "failed":
+                if result["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
                     alert(cfg, "stopping daemon due to login/captcha failure")
                     session.stop()
                     return

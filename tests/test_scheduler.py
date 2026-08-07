@@ -186,3 +186,112 @@ class TestQuotaEnforcement:
         assert db.window_post_count(start.timestamp(), end.timestamp()) == 1
         next_start = datetime(2026, 1, 6, 16, 0)
         assert db.window_post_count(next_start.timestamp(), next_start.timestamp() + 3600) == 0
+
+
+def _after_midnight_posts(db):
+    """Five successful posts after midnight: they belong to the Jan 5 logical
+    window but are Jan 6 local-calendar-day successes."""
+    for minute in (5, 10, 15, 20, 25):
+        _post_at(db, datetime(2026, 1, 6, 0, minute))
+
+
+class TestCalendarDayAbsoluteCap:
+    """Issue 3 regression: max_daily_posts_absolute is a LOCAL CALENDAR-DAY cap,
+    independent from the logical-window count. Overnight posts belong to the
+    previous window but reduce today's absolute allowance."""
+
+    def test_exact_reproduced_bug(self, tmp_path):
+        """5 posts after midnight + new target 6 + absolute cap 10 -> only 5."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)  # new window Jan 6 16:00 -> Jan 7 01:00
+        _after_midnight_posts(db)
+
+        now = datetime(2026, 1, 6, 17, 0)
+        state = scheduler.check_posting_limits(
+            db, 3, 6, 16, 1, max_absolute=10, now=now, rng=random.Random(1)
+        )
+        assert state["allowed"]
+        assert state["window_posts"] == 0
+        assert state["window_room"] == 6
+        assert state["today_posts"] == 5
+        assert state["absolute_room"] == 5
+        assert state["remaining"] == 5  # min(window 6, daily 5), NOT 6
+
+        slots = _slots(db, 16, 1, now, max_absolute=10, seed=1)
+        assert len(slots) == 5
+        assert len(slots) != 6  # must not offer the full window target
+
+    def test_calendar_day_and_window_are_independent(self, tmp_path):
+        db = _db(tmp_path)
+        _after_midnight_posts(db)
+
+        jan6_noon = datetime(2026, 1, 6, 12, 0)
+        assert db.posts_today(now_ts=jan6_noon.timestamp()) == 5  # today Jan 6
+
+        new_window_start = datetime(2026, 1, 6, 16, 0).timestamp()
+        new_window_end = datetime(2026, 1, 7, 1, 0).timestamp()
+        assert db.window_post_count(new_window_start, new_window_end) == 0
+
+    def test_no_calendar_day_room_returns_no_slots(self, tmp_path):
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        for i in range(10):
+            _post_at(db, datetime(2026, 1, 6, 0, i * 2))  # 00:00..00:18 Jan 6
+
+        now = datetime(2026, 1, 6, 17, 0)
+        state = scheduler.check_posting_limits(
+            db, 3, 6, 16, 1, max_absolute=10, now=now, rng=random.Random(1)
+        )
+        assert state["today_posts"] == 10
+        assert state["absolute_room"] == 0
+        assert state["window_room"] == 6  # window still has room...
+        assert not state["allowed"]
+        assert state["reason"] == "daily_absolute_cap"
+        assert _slots(db, 16, 1, now, max_absolute=10, seed=1) == []
+
+    def test_logical_target_reached_blocks_even_with_daily_room(self, tmp_path):
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        for i in range(6):
+            _post_at(db, datetime(2026, 1, 6, 16, 10 + i))  # inside new window
+
+        now = datetime(2026, 1, 6, 17, 0)
+        state = scheduler.check_posting_limits(
+            db, 3, 6, 16, 1, max_absolute=10, now=now, rng=random.Random(1)
+        )
+        assert state["window_posts"] == 6
+        assert state["window_room"] == 0
+        assert state["absolute_room"] == 4  # today at 6/10, still room
+        assert not state["allowed"]
+        assert state["reason"] == "target_reached"
+        assert _slots(db, 16, 1, now, max_absolute=10, seed=1) == []
+
+    def test_absolute_cap_only_a_backstop(self, tmp_path):
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 4)
+        now = datetime(2026, 1, 6, 17, 0)
+        state = scheduler.check_posting_limits(
+            db, 3, 6, 16, 1, max_absolute=10, now=now, rng=random.Random(1)
+        )
+        assert state["today_posts"] == 0
+        assert state["window_room"] == 4
+        assert state["absolute_room"] == 10
+        assert state["remaining"] == 4
+        slots = _slots(db, 16, 1, now, max_absolute=10, seed=1)
+        assert len(slots) == 4  # the backstop never inflates the target
+
+    def test_posts_today_uses_local_calendar_midnight(self, tmp_path):
+        """Local midnight boundary: 23:59 Jan 5 and 00:01 Jan 6 are two days."""
+        db = _db(tmp_path)
+        _post_at(db, datetime(2026, 1, 5, 23, 59))
+        _post_at(db, datetime(2026, 1, 6, 0, 1))
+
+        noon_jan5 = datetime(2026, 1, 5, 12, 0).timestamp()
+        noon_jan6 = datetime(2026, 1, 6, 12, 0).timestamp()
+        assert db.posts_today(now_ts=noon_jan5) == 1  # only the 23:59 one
+        assert db.posts_today(now_ts=noon_jan6) == 1  # only the 00:01 one
+
+        # both still counted inside the Jan 5 logical posting window
+        start = datetime(2026, 1, 5, 16, 0).timestamp()
+        end = datetime(2026, 1, 6, 1, 0).timestamp()
+        assert db.window_post_count(start, end) == 2
