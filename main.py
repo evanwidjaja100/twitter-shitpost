@@ -214,14 +214,19 @@ def cmd_login():
 
 def cmd_sources(cfg):
     from publisher.x_publisher import XSession
+    from publishing_lock import browser_profile_lock
 
-    db = _make_db(cfg)
-    session = XSession(cfg["paths"])
-    session.start()
-    try:
-        result = pick_item(cfg, db, session)
-    finally:
-        session.stop()
+    # Browser-profile lock: sources opens the persistent Brave profile but
+    # never publishes, so it needs the browser lock only (order: browser
+    # lock -> browser startup).
+    with browser_profile_lock(cfg, "sources"):
+        db = _make_db(cfg)
+        session = XSession(cfg["paths"])
+        session.start()
+        try:
+            result = pick_item(cfg, db, session)
+        finally:
+            session.stop()
     if result is None:
         print("No postable item right now (no accounts configured, or everything already posted).")
         return
@@ -234,29 +239,31 @@ def cmd_sources(cfg):
 
 def cmd_once(cfg):
     from publisher.x_publisher import XSession
-    from publishing_lock import publishing_lock
+    from publishing_lock import browser_profile_lock, publishing_lock
 
+    # Lock order is globally fixed: publishing -> browser profile -> browser.
     with publishing_lock(cfg, "once"):
-        db = _make_db(cfg)
-        session = XSession(cfg["paths"])
-        session.start()
-        try:
-            item = pick_item(cfg, db, session)
-            if item is None:
-                alert(cfg, "no item available to post")
-                return
-            res = session.post(item["_caption"], [item["_media_path"]])
-            if res["ok"]:
-                mark_item_published(db, item)
-                logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
-            else:
-                db.add_post(
-                    item["_caption"], item["_media_path"], item["source"],
-                    item["source_url"], item["_hash"], "failed", res["reason"],
-                )
-                alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
-        finally:
-            session.stop()
+        with browser_profile_lock(cfg, "once"):
+            db = _make_db(cfg)
+            session = XSession(cfg["paths"])
+            session.start()
+            try:
+                item = pick_item(cfg, db, session)
+                if item is None:
+                    alert(cfg, "no item available to post")
+                    return
+                res = session.post(item["_caption"], [item["_media_path"]])
+                if res["ok"]:
+                    mark_item_published(db, item)
+                    logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
+                else:
+                    db.add_post(
+                        item["_caption"], item["_media_path"], item["source"],
+                        item["source_url"], item["_hash"], "failed", res["reason"],
+                    )
+                    alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
+            finally:
+                session.stop()
 
 
 def cmd_stats(cfg, offline: bool):
@@ -267,10 +274,17 @@ def cmd_stats(cfg, offline: bool):
     session = None
     if not offline:
         from publisher.x_publisher import XSession
+        from publishing_lock import browser_profile_lock
 
-        session = XSession(cfg["paths"])
-        session.start()
-        maybe_check_followers(db, cfg, session)
+        # Online stats opens the persistent Brave profile for the follower
+        # check: browser-profile lock only (order: browser lock -> browser).
+        with browser_profile_lock(cfg, "stats"):
+            session = XSession(cfg["paths"])
+            session.start()
+            try:
+                maybe_check_followers(db, cfg, session)
+            finally:
+                session.stop()
     history = db.follower_history()
     csv_path = BASE / cfg["paths"]["logs_dir"] / "followers.csv"
     write_csv(str(csv_path), history)
@@ -346,53 +360,152 @@ def attempt_slot(cfg, db, session, now=None, rng=None) -> dict:
 
 
 def cmd_daemon(cfg):
-    from publishing_lock import publishing_lock
+    from publishing_lock import browser_profile_lock, publishing_lock
 
+    # Lock order is globally fixed: publishing -> browser profile -> browser.
+    # Both ownership locks are acquired ONCE here and held for the whole
+    # supervisor lifetime, so a competing `once`/`sources`/`stats`/`login`
+    # cannot slip in while the daemon is between internal browser restarts.
     with publishing_lock(cfg, "daemon"):
-        _run_daemon(cfg)
+        with browser_profile_lock(cfg, "daemon"):
+            supervise_daemon(cfg)
 
 
-def _run_daemon(cfg):
+class DaemonStop(Exception):
+    """Intentional daemon stop requested by the publisher/configuration.
+
+    Raised by the daemon loop when e.g. a login/captcha failure occurs with
+    ``safety.stop_on_login_failure == true``. This is a deliberate shutdown,
+    not a transient crash — the supervisor must NOT restart on it.
+    """
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def supervise_daemon(cfg):
+    """Run the daemon, restarting it on unexpected recoverable exceptions.
+
+    Only ordinary ``Exception`` subclass failures are retried. ``DaemonStop``
+    (intentional login/captcha shutdown), ``KeyboardInterrupt`` and
+    ``SystemExit`` end immediately and are never auto-restarted.
+
+    Recovery model:
+      - unexpected exception -> log stack trace -> best-effort alert -> the
+        current browser session is stopped by ``_run_daemon``'s ``finally`` ->
+        wait with bounded, growing backoff -> construct a fresh session -> run
+        the loop again. Both global ownership locks (publishing + browser
+        profile) stay held for the whole supervisor call (they are acquired in
+        ``cmd_daemon``), so no other process can enter during recovery backoff.
+      - a fully completed daemon loop iteration resets the consecutive-failure
+        counter (successful daemon operation for a meaningful period).
+      - after ``max_daemon_restarts`` consecutive failures the exception is
+        re-raised so the process exits non-zero, letting Task Scheduler / a
+        process supervisor act as the second recovery layer.
+    """
+    log = logging.getLogger("daemon")
+    safety = cfg.get("safety", {})
+    max_restarts = max(int(safety.get("max_daemon_restarts", 5)), 1)
+    base_seconds = max(float(safety.get("retry_backoff_minutes", 30)) * 60.0, 5.0)
+    cap_seconds = base_seconds * 10.0
+    state = {"consecutive": 0}
+
+    def clear_heartbeat():
+        if state["consecutive"]:
+            state["consecutive"] = 0
+
+    while True:
+        try:
+            _run_daemon(cfg, on_success=clear_heartbeat)
+            return  # reached an intentional stop -> clean, no restart
+        except DaemonStop as stop:
+            log.info("daemon stopping intentionally: %s", stop.reason)
+            return
+        except KeyboardInterrupt:
+            raise
+        except SystemExit:
+            raise
+        except Exception as exc:
+            state["consecutive"] += 1
+            n = state["consecutive"]
+            log.exception("daemon failed unexpectedly (consecutive failures: %d)", n)
+            alert(cfg, f"daemon crashed unexpectedly (attempt {n}): {exc!r}")
+            if n >= max_restarts:
+                log.critical("daemon failed %d consecutive times; giving up", n)
+                alert(cfg, "daemon gave up after repeated unexpected failures")
+                raise  # non-zero process exit -> outer recovery layer
+            delay = min(base_seconds * n, cap_seconds)
+            log.warning("restarting daemon in %d seconds (failure %d)", delay, n)
+            time.sleep(delay)
+
+
+def _run_daemon(cfg, on_success=None):
+    """Run one daemon session: DB + browser + loop until stop or failure.
+
+    The browser session is always stopped on the way out (success, intentional
+    stop, or unexpected crash) via ``finally``; ``on_success`` fires after each
+    fully completed loop iteration so a supervisor can reset its failure
+    counter only after genuinely productive work.
+    """
     from publisher.x_publisher import XSession
-    import scheduler
 
     db = _make_db(cfg)
     session = XSession(cfg["paths"])
-    session.start()
+    log = logging.getLogger("daemon")
+    try:
+        session.start()
+        log.info("daemon session started")
+        while True:
+            _daemon_iteration(cfg, db, session)
+            if on_success is not None:
+                on_success()
+    finally:
+        try:
+            session.stop()
+        except Exception:
+            log.warning("error stopping daemon session (best effort)", exc_info=True)
+
+
+def _daemon_iteration(cfg, db, session):
+    """One pass of the daemon main loop (followers + current posting window).
+
+    Returns when the pass is complete without raising; raises
+    :class:`DaemonStop` for an intentional configured shutdown (login/captcha
+    with ``stop_on_login_failure``). Any other exception is an unexpected
+    daemon failure for the supervisor to recover from.
+    """
+    from tracker import maybe_check_followers
+    import scheduler
+
     log = logging.getLogger("daemon")
     posting = cfg["posting"]
     safety = cfg["safety"]
-    log.info("daemon started; %d-%d posts/day between %02d:00-%02d:00",
-             posting["min_posts_per_day"], posting["max_posts_per_day"],
-             posting["active_hours_start"], posting["active_hours_end"])
-    while True:
-        from tracker import maybe_check_followers
 
-        maybe_check_followers(db, cfg, session)
-        times = scheduler.remaining_slots(
-            db,
-            posting["min_posts_per_day"],
-            posting["max_posts_per_day"],
-            posting["active_hours_start"],
-            posting["active_hours_end"],
-            max_absolute=safety["max_daily_posts_absolute"],
-        )
-        if not times:
-            log.info("no remaining posting slots in the current window; waiting")
-            time.sleep(60)
-            continue
-        for t in times:
-            scheduler.sleep_until(t)
-            # Fresh quota re-check before any pick/post: precomputed slots are
-            # only an estimate; the DB decides now.
-            result = attempt_slot(cfg, db, session)
-            if result["outcome"] == "failed":
-                if result["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
-                    alert(cfg, "stopping daemon due to login/captcha failure")
-                    session.stop()
-                    return
-                time.sleep(safety["retry_backoff_minutes"] * 60)
+    maybe_check_followers(db, cfg, session)
+    times = scheduler.remaining_slots(
+        db,
+        posting["min_posts_per_day"],
+        posting["max_posts_per_day"],
+        posting["active_hours_start"],
+        posting["active_hours_end"],
+        max_absolute=safety["max_daily_posts_absolute"],
+    )
+    if not times:
+        log.info("no remaining posting slots in the current window; waiting")
         time.sleep(60)
+        return
+    for t in times:
+        scheduler.sleep_until(t)
+        # Fresh quota re-check before any pick/post: precomputed slots are
+        # only an estimate; the DB decides now.
+        result = attempt_slot(cfg, db, session)
+        if result["outcome"] == "failed":
+            if result["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
+                alert(cfg, "stopping daemon due to login/captcha failure")
+                raise DaemonStop(result["reason"])
+            time.sleep(safety["retry_backoff_minutes"] * 60)
+    time.sleep(60)
 
 
 def _make_db(cfg):

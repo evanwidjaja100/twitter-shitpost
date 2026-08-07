@@ -1,20 +1,33 @@
-"""Single-instance publishing lock backed by the operating system.
+"""Process-level single-instance OS file locks for the bot.
 
-Only one publishing process (`daemon` or `once`) may run for a given bot
-database at a time. The lock is an exclusive OS lock on a small sidecar file
-next to the SQLite database:
+Two distinct resources are guarded, so they get two logical locks backed by the
+same small, non-blocking OS file-lock primitive (:class:`ProcessFileLock`):
+
+* **PUBLISHING lock** — at most one publishing process per bot database
+  (``daemon`` and ``once``). Guards publication ownership.
+* **BROWSER-PROFILE lock** — at most one opener of the configured persistent
+  Brave profile (``daemon``, ``once``, ``sources``, online ``stats``,
+  ``login``). Guards browser/cookie/profile ownership.
+
+Both are authoritative **OS-held locks**:
 
 * Windows: ``msvcrt.locking(LK_NBLCK)`` on byte 0 of the file
 * POSIX:   ``fcntl.flock(LOCK_EX | LOCK_NB)``
 
-The OS automatically releases the lock when the owning process exits or
-crashes, so a stale lock file on disk is harmless — the file's existence must
-never be treated as "bot is running". The file content (pid/start/command) is
-informational only and is never used as the ownership mechanism.
+The OS automatically releases a lock when its owning process exits or crashes,
+so a stale lock file alone is never treated as "running" — file existence,
+directory existence, PID text or lock metadata are never ownership. The file
+content (pid/start/command) is informational only.
 
-This lock is a process-lifetime lock: it is acquired once before the publishing
-browser/profile starts and held for the whole command. It must never be used
-to hold a SQLite transaction open while scraping, sleeping, or posting.
+Lock ordering is globally fixed — never acquire in the reverse order:
+
+    publishing lock -> browser-profile lock -> browser startup
+
+so `daemon`/`once` hold the publishing lock first and the browser lock second,
+and browser-only commands (sources / stats / login) hold the browser lock only.
+No lock is ever held across a long-running SQLite transaction; they are
+process-lifetime ownership locks acquired before browser startup and released
+in a ``finally`` on every exit path.
 """
 
 import logging
@@ -25,18 +38,33 @@ from contextlib import contextmanager
 from pathlib import Path
 
 LOCK_FILE_NAME = "publisher.lock"
+BROWSER_LOCK_SUFFIX = ".browser.lock"
 
 
-class PublishLockUnavailable(Exception):
+class LockUnavailable(Exception):
+    """The requested OS file lock is held by another process."""
+
+
+class PublishLockUnavailable(LockUnavailable):
     """Another publishing process already owns the lock."""
 
 
-class PublishLock:
-    """An exclusive OS file lock (non-blocking, non-reentrant).
+class BrowserProfileLockUnavailable(LockUnavailable):
+    """Another bot command already opened the configured browser profile."""
 
-    ``acquire()`` fails fast with :class:`PublishLockUnavailable` if another
-    process holds it; ``release()`` is idempotent and always closes the handle.
+
+class ProcessFileLock:
+    """A non-blocking, exclusive OS file lock (cross-platform).
+
+    ``acquire()`` fails fast with :class:`LockUnavailable` (via the class-level
+    ``unavailable_error``) if another process holds it; ``release()`` is
+    idempotent and always closes the fd, which is what actually frees the lock
+    with the OS. The lock file's parent directory is created on demand so fresh
+    installs (where ``data/`` or the profile's parent may not exist yet) work
+    identically to established ones.
     """
+
+    unavailable_error = LockUnavailable
 
     def __init__(self, path):
         self.path = Path(path)
@@ -47,10 +75,9 @@ class PublishLock:
         return self._fh is not None
 
     def _open_for_lock(self):
-        # The parent dir (e.g. <repo>/data/) may not exist yet on a fresh
-        # install; the lock runs before the database constructor creates it.
-        # Idempotent: never an error if it already exists, never deletes or
-        # recreates the configured DB directory.
+        # Parent dir may be absent on a fresh install (the natural DB/profile
+        # directory is created later by Browser/Database startup). Idempotent:
+        # never an error if it already exists, never deletes/recreates it.
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # r+b requires an existing file; create it (with a byte of metadata)
         # when it is missing so there is always something to lock on Windows.
@@ -75,7 +102,7 @@ class PublishLock:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             self._close_failed_lock_handle(fh)
-            raise PublishLockUnavailable(self.path) from None
+            raise self.unavailable_error(self.path) from None
         # Lock owned: metadata (informational only) is written now so a losing
         # process never writes into a region the winner has locked.
         try:
@@ -142,19 +169,62 @@ class PublishLock:
         self.release()
 
 
+class PublishLock(ProcessFileLock):
+    """Semantic wrapper: the single-instance publishing lock."""
+
+    unavailable_error = PublishLockUnavailable
+
+
+class BrowserProfileLock(ProcessFileLock):
+    """Semantic wrapper: the single-opener persistent-browser lock."""
+
+    unavailable_error = BrowserProfileLockUnavailable
+
+
+def _repo_base() -> Path:
+    return Path(__file__).resolve().parent
+
+
 def lock_path_from_cfg(cfg: dict) -> Path:
-    """Deterministic single-instance lock path for a bot instance.
+    """Deterministic single-instance PUBLISHING lock path for a bot instance.
 
     Derived from the configured database location, resolved against the
     repository root (never the shell CWD), so ``daemon``/``once``/tests always
     target the same lock for the same bot regardless of where Python was
     launched. The lock sits next to the bot's SQLite database.
     """
-    base = Path(__file__).resolve().parent
+    base = _repo_base()
     db_file = Path(str(cfg["paths"]["db_file"]))
     if not db_file.is_absolute():
         db_file = base / db_file
     return db_file.parent / LOCK_FILE_NAME
+
+
+def browser_lock_path_from_cfg(cfg: dict) -> Path:
+    """Deterministic BROWSER-PROFILE lock path for the configured profile.
+
+    Keyed to the *resolved persistent browser profile* (never merely the
+    database), so two bots configured with the same profile (regardless of DB)
+    collide here, while different profiles get different lock paths. Relative
+    profiles resolve against the same repository/``_base`` used by the real
+    browser code (repo root by default), making the result absolute and
+    independent of the shell CWD. The lock is a sidecar sibling of the profile
+    directory — nothing is written inside Brave's own profile internals.
+    """
+    paths = cfg.get("paths", {}) or {}
+    base = Path(paths.get("_base") or _repo_base())
+    profile = paths.get("browser_profile") or "browser_profile"
+    p = Path(profile)
+    if not p.is_absolute():
+        p = base / p
+    resolved = p.resolve()
+    return resolved.parent / (resolved.name + BROWSER_LOCK_SUFFIX)
+
+
+def _refuse(lock_log_name: str, command: str, message: str):
+    print(message)
+    logging.getLogger("lock").error("%s refused: %s", command, message)
+    sys.exit(1)
 
 
 @contextmanager
@@ -170,11 +240,38 @@ def publishing_lock(cfg: dict, command: str):
     try:
         lock.acquire(command=command)
     except PublishLockUnavailable:
-        msg = ("Another publishing instance is already running. "
-               "Refusing to start a second publisher.")
-        print(msg)
-        logging.getLogger("lock").error("%s refused: %s", command, msg)
-        sys.exit(1)
+        _refuse(
+            "publish",
+            command,
+            "Another publishing instance is already running. "
+            "Refusing to start a second publisher.",
+        )
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
+@contextmanager
+def browser_profile_lock(cfg: dict, command: str):
+    """Acquire the browser-profile lock for the configured persistent profile.
+
+    Any command that will open the configured Brave profile (daemon/once/
+    sources/online stats/login) must hold this while the browser is open, and
+    it must be acquired BEFORE ``XSession()``/``sync_playwright``/browser
+    startup. On contention the command refuses quickly (non-zero exit) without
+    ever starting Playwright.
+    """
+    lock = BrowserProfileLock(browser_lock_path_from_cfg(cfg))
+    try:
+        lock.acquire(command=command)
+    except BrowserProfileLockUnavailable:
+        _refuse(
+            "browser-profile",
+            command,
+            "The configured Brave profile is already in use by another bot command. "
+            "Refusing to open a second persistent browser session.",
+        )
     try:
         yield lock
     finally:

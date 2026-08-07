@@ -28,7 +28,8 @@ def write_marker(marker_path: str):
 
 def main() -> int:
     paths = load_config_paths()
-    profile_dir = str(Path(paths["browser_profile"]).resolve())
+    base = Path(paths["_base"])
+    profile_dir = str((base / paths["browser_profile"]).resolve())
     brave = paths.get("brave")
     marker = str(Path(paths["logs_dir"]) / "logged_in.json")
 
@@ -44,46 +45,53 @@ def main() -> int:
     print("The window will auto-close once login is detected (or after 6 min).")
     print("=" * 60)
 
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            executable_path=brave,
-            headless=False,
-            viewport={"width": 1280, "height": 900},
-            user_agent=BRAVE_WINDOWS_UA,
-            locale="en-US",
-            args=list(BROWSER_EXTRA_ARGS),
-        )
-        install_anti_detection(context)
-        page = context.new_page()
-        page.goto("https://x.com", wait_until="domcontentloaded", timeout=60000)
+    # Authoritative browser-profile check lives here (not only in main.py's
+    # cmd_login): `python login.py` must be refused too if the daemon/another
+    # command already has the persistent Brave profile open. Acquired BEFORE
+    # Playwright starts; held until the login window closes.
+    from publishing_lock import browser_profile_lock
 
-        deadline = time.time() + 6 * 60
-        logged_in = False
-        while time.time() < deadline:
-            try:
-                url = page.url
-                compose_visible = page.locator(
-                    'a[data-testid="SideNav_NewTweet_Button"]'
-                ).count() > 0 or "home" in url
-                if compose_visible or "x.com/home" in url:
-                    logged_in = True
-                    break
-            except Exception:
-                pass
-            time.sleep(5)
+    with browser_profile_lock({"paths": paths}, "login"):
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                executable_path=brave,
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+                user_agent=BRAVE_WINDOWS_UA,
+                locale="en-US",
+                args=list(BROWSER_EXTRA_ARGS),
+            )
+            install_anti_detection(context)
+            page = context.new_page()
+            page.goto("https://x.com", wait_until="domcontentloaded", timeout=60000)
 
-        if logged_in:
-            write_marker(marker)
-            print("[OK] Login detected. Session saved in the bot profile.")
-            page.close()
-            context.close()
-            return 0
-        else:
-            print("[FAIL] Login not detected within 6 minutes. Run `python login.py` again.")
-            page.close()
-            context.close()
-            return 1
+            deadline = time.time() + 6 * 60
+            logged_in = False
+            while time.time() < deadline:
+                try:
+                    url = page.url
+                    compose_visible = page.locator(
+                        'a[data-testid="SideNav_NewTweet_Button"]'
+                    ).count() > 0 or "home" in url
+                    if compose_visible or "x.com/home" in url:
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(5)
+
+            if logged_in:
+                write_marker(marker)
+                print("[OK] Login detected. Session saved in the bot profile.")
+                page.close()
+                context.close()
+                return 0
+            else:
+                print("[FAIL] Login not detected within 6 minutes. Run `python login.py` again.")
+                page.close()
+                context.close()
+                return 1
 
 
 if __name__ == "__main__":

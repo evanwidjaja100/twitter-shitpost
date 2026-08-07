@@ -8,3 +8,4 @@ logs/
 tools/
 config.json
 session_state.json
+*.browser.lock
