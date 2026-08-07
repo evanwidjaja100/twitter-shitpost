@@ -187,12 +187,16 @@ def pick_item(cfg: dict, db, session=None) -> dict | None:
 
 
 def mark_item_published(db, item) -> None:
-    """Record dedup state only after a post has been confirmed successful.
+    """Finalize a positively confirmed successful post in one transaction.
 
-    Done in one database transaction so source + media hash stay consistent.
-    Shared by every publishing path (manual and daemon) so they cannot diverge.
+    Writes post history plus source/media-hash dedup together (the scheduler's
+    per-window success count is derived from the posts table, so it is updated
+    in the same atomic write). Shared by every publishing path — manual and
+    daemon — so they cannot diverge.
     """
-    db.record_successful_item(
+    db.finalize_successful_post(
+        caption=item["_caption"],
+        media_path=item["_media_path"],
         source=item["source"],
         source_id=item["source_id"],
         source_url=item["source_url"],
@@ -240,15 +244,14 @@ def cmd_once(cfg):
             alert(cfg, "no item available to post")
             return
         res = session.post(item["_caption"], [item["_media_path"]])
-        db.add_post(
-            item["_caption"], item["_media_path"], item["source"],
-            item["source_url"], item["_hash"], "posted" if res["ok"] else "failed",
-            res["reason"],
-        )
         if res["ok"]:
             mark_item_published(db, item)
             logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
         else:
+            db.add_post(
+                item["_caption"], item["_media_path"], item["source"],
+                item["source_url"], item["_hash"], "failed", res["reason"],
+            )
             alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
     finally:
         session.stop()
@@ -301,33 +304,33 @@ def cmd_daemon(cfg):
         from tracker import maybe_check_followers
 
         maybe_check_followers(db, cfg, session)
-        times = scheduler.compute_post_times(
-            posting["min_posts_per_day"], posting["max_posts_per_day"],
-            posting["active_hours_start"], posting["active_hours_end"],
+        times = scheduler.remaining_slots(
+            db,
+            posting["min_posts_per_day"],
+            posting["max_posts_per_day"],
+            posting["active_hours_start"],
+            posting["active_hours_end"],
+            max_absolute=safety["max_daily_posts_absolute"],
         )
         if not times:
-            log.info("no remaining slots today; waiting for tomorrow")
+            log.info("no remaining posting slots in the current window; waiting")
             time.sleep(60)
             continue
         for t in times:
             scheduler.sleep_until(t)
-            if db.posts_today() >= safety["max_daily_posts_absolute"]:
-                log.info("daily cap reached; sleeping")
-                break
             item = pick_item(cfg, db, session)
             if item is None:
                 log.info("no item found; skipping slot")
                 continue
             res = session.post(item["_caption"], [item["_media_path"]])
-            db.add_post(
-                item["_caption"], item["_media_path"], item["source"],
-                item["source_url"], item["_hash"], "posted" if res["ok"] else "failed",
-                res["reason"],
-            )
             if res["ok"]:
                 mark_item_published(db, item)
                 log.info("POSTED: %s", item["source_url"])
             else:
+                db.add_post(
+                    item["_caption"], item["_media_path"], item["source"],
+                    item["source_url"], item["_hash"], "failed", res["reason"],
+                )
                 alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
                 if res["reason"] in ("login", "captcha") and safety["stop_on_login_failure"]:
                     alert(cfg, "stopping daemon due to login/captcha failure")

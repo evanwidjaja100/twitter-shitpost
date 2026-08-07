@@ -204,25 +204,25 @@ class XSession:
             post_btn.wait_for(state="visible", timeout=timeout_ms)
             post_btn.click()
 
+            # Success must be positively confirmed. Navigations, login/captcha
+            # redirects or a changed URL are NEVER treated as proof of posting.
             deadline = time.time() + timeout_s
-            sent = False
             while time.time() < deadline:
-                if page.locator("text=Your post was sent").count() > 0:
-                    sent = True
-                    break
-                try:
-                    if "compose/post" not in page.url:
-                        sent = True
-                        break
-                except Exception:
-                    pass
+                # Login/captcha/error state is checked before interpreting any
+                # navigation so a redirect to those pages fails the post.
                 if problem := self.detect_problem(page):
                     return {"ok": False, "reason": problem}
+                if page.locator("text=Your post was sent").count() > 0:
+                    return {"ok": True, "reason": "posted"}
+                try:
+                    if "compose/post" not in page.url:
+                        # Navigated away without the success signal and without
+                        # a detected problem: ambiguous, never claim success.
+                        return {"ok": False, "reason": "unverified"}
+                except Exception:
+                    pass
                 page.wait_for_timeout(1500)
-
-            if not sent:
-                return {"ok": False, "reason": "timeout"}
-            return {"ok": True, "reason": "posted"}
+            return {"ok": False, "reason": "timeout"}
 
         except Exception as e:
             return {"ok": False, "reason": f"exception: {e}"}

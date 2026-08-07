@@ -65,6 +65,9 @@ class _FailingConnection:
     def commit(self):
         return self._real.commit()
 
+    def rollback(self):
+        return self._real.rollback()
+
 
 class TestPickItemSelection:
     def test_selection_records_nothing(self, db, tmp_path):
@@ -136,12 +139,27 @@ class TestCmdOnce:
         assert not db.is_hash_seen("deadbeef1234", 30)
         alert.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "reason", ["unverified", "timeout", "error", "captcha", "login"]
+    )
+    def test_ambiguous_or_failed_publisher_never_records(self, tmp_path, reason):
+        """Every non-positive publisher result must skip permanent dedup."""
+        db, session, alert = self._run(
+            tmp_path, item=_item(), session_result={"ok": False, "reason": reason}
+        )
+        assert session.post.call_count == 1
+        assert not db.is_source_seen("youtube", "vid-1")
+        assert not db.is_hash_seen("deadbeef1234", 30)
+        alert.assert_called_once()
+
 
 class TestMarkItemPublished:
     def test_calls_atomic_recorder_with_item_fields(self):
         db = mock.MagicMock()
         main.mark_item_published(db, _item())
-        db.record_successful_item.assert_called_once_with(
+        db.finalize_successful_post.assert_called_once_with(
+            caption="caption",
+            media_path="media.mp4",
             source="youtube",
             source_id="vid-1",
             source_url="https://youtu.be/vid-1",
@@ -153,7 +171,9 @@ class TestMarkItemPublished:
         item = _item()
         item.pop("_hash")
         main.mark_item_published(db, item)
-        db.record_successful_item.assert_called_once_with(
+        db.finalize_successful_post.assert_called_once_with(
+            caption="caption",
+            media_path="media.mp4",
             source="youtube",
             source_id="vid-1",
             source_url="https://youtu.be/vid-1",
