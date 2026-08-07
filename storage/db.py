@@ -107,6 +107,37 @@ class Database:
             )
             self._conn.commit()
 
+    def record_successful_item(
+        self,
+        source: str,
+        source_id: str,
+        source_url: str,
+        content_hash: str | None,
+    ):
+        """Record a successfully published item in one transaction.
+
+        Both the source dedup and the media-hash dedup are written together so
+        a partial write can never leave the database inconsistent.
+        """
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO source_seen (source, source_id, first_seen) VALUES (?, ?, ?)",
+                (source, source_id, now),
+            )
+            if content_hash:
+                self._conn.execute(
+                    """
+                    INSERT INTO hashes (hash, source, source_url, first_seen, last_seen, post_count)
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    ON CONFLICT(hash) DO UPDATE SET
+                        last_seen = excluded.last_seen,
+                        post_count = post_count + 1
+                    """,
+                    (content_hash, source, source_url, now, now),
+                )
+            self._conn.commit()
+
     def add_post(self, caption, media_path, source, source_url, content_hash, status, error=None):
         with self._lock:
             self._conn.execute(

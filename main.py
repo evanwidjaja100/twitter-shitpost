@@ -113,9 +113,10 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
         return None
 
 
-def pick_item(cfg: dict, db, session=None, commit: bool = True) -> dict | None:
-    """Scrape all sources, dedup, and return the single best postable item.
-    With commit=False nothing is recorded (preview mode)."""
+def pick_item(cfg: dict, db, session=None) -> dict | None:
+    """Scrape all sources, dedup against history, and return the single best
+    postable item. Nothing is recorded here — dedup happens only after a
+    publication is confirmed successful."""
     from pipeline.filters import title_contains_blocked_keywords
 
     log = logging.getLogger("select")
@@ -178,14 +179,25 @@ def pick_item(cfg: dict, db, session=None, commit: bool = True) -> dict | None:
             cfg["posting"]["random_caption_chance"],
             cfg["posting"]["max_caption_len"],
         )
-        if commit:
-            db.record_source(item["source"], item["source_id"])
-            db.record_hash(h, item["source"], item["source_url"])
         item["_media_path"] = media_path
         item["_caption"] = caption
         item["_hash"] = h
         return item
     return None
+
+
+def mark_item_published(db, item) -> None:
+    """Record dedup state only after a post has been confirmed successful.
+
+    Done in one database transaction so source + media hash stay consistent.
+    Shared by every publishing path (manual and daemon) so they cannot diverge.
+    """
+    db.record_successful_item(
+        source=item["source"],
+        source_id=item["source_id"],
+        source_url=item["source_url"],
+        content_hash=item.get("_hash"),
+    )
 
 
 # ------------------------------------------------------------- commands
@@ -203,7 +215,7 @@ def cmd_sources(cfg):
     session = XSession(cfg["paths"])
     session.start()
     try:
-        result = pick_item(cfg, db, session, commit=False)
+        result = pick_item(cfg, db, session)
     finally:
         session.stop()
     if result is None:
@@ -234,6 +246,7 @@ def cmd_once(cfg):
             res["reason"],
         )
         if res["ok"]:
+            mark_item_published(db, item)
             logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
         else:
             alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")
@@ -312,6 +325,7 @@ def cmd_daemon(cfg):
                 res["reason"],
             )
             if res["ok"]:
+                mark_item_published(db, item)
                 log.info("POSTED: %s", item["source_url"])
             else:
                 alert(cfg, f"post failed: {res['reason']} | {item['source_url']}")

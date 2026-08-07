@@ -162,15 +162,15 @@ class XSession:
         return None
 
     @staticmethod
-    def _type_humanized(page: Page, text: str):
+    def _type_humanized(composer, text: str):
         for chunk in [text[i : i + 3] for i in range(0, len(text), 3)]:
-            page.keyboard.type(chunk)
-            page.wait_for_timeout(random.randint(30, 180))
+            composer.press_sequentially(chunk, delay=random.randint(30, 180))
 
     # ------------------------------------------------------------- posting
 
     def post(self, caption: str, media_paths: list[str], timeout_s: int = 60) -> dict:
         """Post one tweet with attached media. Returns {"ok": bool, "reason": str}."""
+        timeout_ms = max(1, int(timeout_s * 1000))
         for p in media_paths:
             if not Path(p).exists():
                 return {"ok": False, "reason": f"missing media file {p}"}
@@ -183,24 +183,25 @@ class XSession:
                 return {"ok": False, "reason": problem}
 
             composer = page.locator('textarea[data-testid="tweetTextarea_0"]')
-            composer.wait_for(state="visible", timeout=timeout_s)
+            composer.wait_for(state="visible", timeout=timeout_ms)
 
             file_input = page.locator('input[data-testid="fileInput"]')
-            file_input.wait_for(state="attached", timeout=timeout_s)
+            file_input.wait_for(state="attached", timeout=timeout_ms)
             file_input.set_input_files(media_paths)
 
             page.locator('div[data-testid="attachments"]').wait_for(
-                state="visible", timeout=timeout_s
+                state="visible", timeout=timeout_ms
             )
 
             if caption:
-                self._type_humanized(page, caption)
+                composer.click()
+                self._type_humanized(composer, caption)
 
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
             post_btn = page.locator('button[data-testid="tweetButtonInline"]')
-            post_btn.wait_for(state="visible", timeout=timeout_s)
+            post_btn.wait_for(state="visible", timeout=timeout_ms)
             post_btn.click()
 
             deadline = time.time() + timeout_s

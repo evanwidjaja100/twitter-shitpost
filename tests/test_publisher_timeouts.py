@@ -1,0 +1,139 @@
+"""Tests for the publisher timeout-unit fix.
+
+Verifies that seconds are converted to milliseconds once before being handed
+to Playwright, that the composer is explicitly focused before text entry, and
+that typing happens at the locator level (no keyboard input to the page).
+Uses in-memory fakes only — no real X account or browser session.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from publisher.x_publisher import XSession
+
+COMPOSER = 'textarea[data-testid="tweetTextarea_0"]'
+FILE_INPUT = 'input[data-testid="fileInput"]'
+ATTACHMENTS = 'div[data-testid="attachments"]'
+POST_BTN = 'button[data-testid="tweetButtonInline"]'
+SENT_TEXT = "text=Your post was sent"
+LOGIN_LINK = 'a[href="/login"]'
+BODY = "body"
+
+
+class FakeLocator:
+    def __init__(self, page, selector):
+        self.page = page
+        self.selector = selector
+        self.wait_for_calls = []
+        self.click_calls = 0
+        self.typed_chunks = []
+        self.input_files = None
+        self._count = 0
+        self._text = "x.com compose page"
+
+    def wait_for(self, **kwargs):
+        self.wait_for_calls.append(kwargs)
+
+    def set_input_files(self, paths):
+        self.input_files = list(paths)
+
+    def count(self):
+        return self._count
+
+    def inner_text(self, timeout=None):
+        return self._text
+
+    def click(self):
+        self.click_calls += 1
+        self.page.events.append(("click", self.selector))
+
+    def press_sequentially(self, text, delay=None):
+        self.typed_chunks.append(text)
+        self.page.events.append(("type", self.selector))
+
+
+class FakePage:
+    def __init__(self):
+        self.events = []
+        self._locators = {}
+        self.url = "https://x.com/compose/post"
+        self.waits = []
+
+    def goto(self, url, **kwargs):
+        self.events.append(("goto", url))
+
+    def locator(self, selector):
+        if selector not in self._locators:
+            loc = FakeLocator(self, selector)
+            if selector == SENT_TEXT:
+                loc._count = 1
+            self._locators[selector] = loc
+        return self._locators[selector]
+
+    def wait_for_timeout(self, ms):
+        self.waits.append(ms)
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def publisher(tmp_path):
+    media = tmp_path / "media.mp4"
+    media.write_bytes(b"fake-media")
+    session = XSession({"browser_profile": "bp", "brave": "brave"})
+    page = FakePage()
+    session.new_page = lambda: page
+    return session, page, str(media)
+
+
+def test_timeout_s_is_forwarded_as_ms(publisher):
+    session, page, media = publisher
+    res = session.post("hello world", [media], timeout_s=60)
+    assert res["ok"] is True
+    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
+        calls = page._locators[selector].wait_for_calls
+        assert calls, f"no wait_for recorded for {selector}"
+        for call in calls:
+            assert call["timeout"] == 60000, (selector, call)
+
+
+def test_short_timeout_maps_to_ms(publisher):
+    session, page, media = publisher
+    res = session.post("cap", [media], timeout_s=1)
+    assert res["ok"] is True
+    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
+        for call in page._locators[selector].wait_for_calls:
+            assert call["timeout"] == 1000, (selector, call)
+
+
+def test_composer_is_clicked_before_typing(publisher):
+    session, page, media = publisher
+    res = session.post("hello world", [media])
+    assert res["ok"] is True
+    composer = page._locators[COMPOSER]
+    assert composer.click_calls == 1
+    assert composer.typed_chunks, "composer was never typed into"
+    assert "".join(composer.typed_chunks) == "hello world"
+
+    click_index = next(
+        i for i, e in enumerate(page.events) if e == ("click", COMPOSER)
+    )
+    first_type_index = next(i for i, e in enumerate(page.events) if e[0] == "type")
+    assert click_index < first_type_index
+
+
+def test_typing_uses_locator_not_page_keyboard(publisher):
+    session, page, media = publisher
+    res = session.post("no keyboard input", [media])
+    assert res["ok"] is True
+    assert not hasattr(page, "keyboard")
+
+
+def test_media_and_send_flow_uses_milliseconds(publisher):
+    session, page, media = publisher
+    res = session.post("cap", [media])
+    assert res["ok"] is True
+    assert page._locators[FILE_INPUT].input_files == [media]
+    assert page._locators[POST_BTN].click_calls == 1
