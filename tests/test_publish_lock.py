@@ -179,6 +179,36 @@ class TestSingleInstanceLock:
         lock.acquire()  # reusable after the exception walked out
         lock.release()
 
+    def test_acquire_creates_missing_parent_directory(self, tmp_path):
+        """Fresh-install case: lock parent dir absent -> acquire creates it."""
+        lock_path = tmp_path / "missing" / "data" / "publisher.lock"
+        assert not lock_path.parent.exists()
+        lock = PublishLock(lock_path)
+        lock.acquire(command="test")
+        try:
+            assert lock.held
+            assert lock_path.parent.exists()
+            assert lock_path.exists()
+        finally:
+            lock.release()
+        assert not lock.held
+
+    def test_acquire_creates_missing_dir_from_cfg(self, tmp_path):
+        """Config-derived path: same guarantee through lock_path_from_cfg."""
+        cfg = {
+            "paths": {"db_file": str(tmp_path / "brand-new" / "data" / "bot.db")}
+        }
+        lock_path = lock_path_from_cfg(cfg)
+        assert not lock_path.parent.exists()
+        lock = PublishLock(lock_path)
+        lock.acquire(command="test")
+        try:
+            assert lock.held
+            assert lock_path.parent.exists()
+            assert lock_path.exists()
+        finally:
+            lock.release()
+
 
 # ---------------------------------------------------------------- entry points
 
@@ -273,6 +303,22 @@ class TestPublisherEntryPoints:
         lock = PublishLock(lock_path_from_cfg(cfg))
         lock.acquire()  # lock was released by cmd_once
         lock.release()
+
+    def test_once_fresh_install_creates_missing_dir(self, tmp_path):
+        """`once` on a fresh install: lock dir absent, flow still reaches post."""
+        cfg = _once_cfg(tmp_path / "brand-new" / "data" / "bot.db")
+        assert not Path(cfg["paths"]["db_file"]).parent.exists()
+        db = Database(str(cfg["paths"]["db_file"]))
+        session = mock.MagicMock()
+        session.post.return_value = {"ok": True, "reason": "posted"}
+        with mock.patch("main._make_db", return_value=db), \
+                mock.patch("publisher.x_publisher.XSession", return_value=session), \
+                mock.patch("main.pick_item", return_value=_item()), \
+                mock.patch("main.alert") as alert:
+            main.cmd_once(cfg)  # must NOT raise FileNotFoundError
+        session.post.assert_called_once()
+        alert.assert_not_called()
+        assert lock_path_from_cfg(cfg).parent.exists()
 
     def test_non_publishing_command_not_blocked(self, tmp_path):
         """A read-only command still operates while the publish lock is held."""

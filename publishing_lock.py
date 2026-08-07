@@ -47,6 +47,11 @@ class PublishLock:
         return self._fh is not None
 
     def _open_for_lock(self):
+        # The parent dir (e.g. <repo>/data/) may not exist yet on a fresh
+        # install; the lock runs before the database constructor creates it.
+        # Idempotent: never an error if it already exists, never deletes or
+        # recreates the configured DB directory.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         # r+b requires an existing file; create it (with a byte of metadata)
         # when it is missing so there is always something to lock on Windows.
         try:
