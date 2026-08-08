@@ -1,7 +1,34 @@
 import sqlite3
 import time
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def local_day_bounds(now_ts, tz=None) -> tuple[float, float]:
+    """Epoch bounds ``[start, end)`` of the LOCAL calendar day containing `now_ts`.
+
+    Both bounds are constructed as real local midnights: the midnight of
+    ``now_ts``'s date and the midnight of the next local date. Converting each
+    midnight to an epoch timestamp (rather than adding 86_400 seconds to the
+    start) is what makes local days that are 23 or 25 hours long — DST spring
+    forward / fall back — produce correct 23 h / 25 h windows instead of a
+    fixed 24 hours.
+
+    ``tz`` is ``None`` (host local, naive — backward compatible with the rest of
+    the codebase) or an explicit ``zoneinfo.ZoneInfo`` for deterministic tests.
+    """
+    if tz is None:
+        base = datetime.fromtimestamp(float(now_ts))
+        start_dt = datetime(base.year, base.month, base.day)
+        next_date = base.date() + timedelta(days=1)
+        end_dt = datetime(next_date.year, next_date.month, next_date.day)
+    else:
+        base = datetime.fromtimestamp(float(now_ts), tz)
+        start_dt = datetime(base.year, base.month, base.day, tzinfo=tz)
+        next_date = base.date() + timedelta(days=1)
+        end_dt = datetime(next_date.year, next_date.month, next_date.day, tzinfo=tz)
+    return start_dt.timestamp(), end_dt.timestamp()
 
 
 class Database:
@@ -239,18 +266,19 @@ class Database:
                     pass
                 raise
 
-    def posts_today(self, now_ts: float | None = None) -> int:
-        """Successful posts in the machine-local calendar day of `now_ts`.
+    def posts_today(self, now_ts: float | None = None, tz=None) -> int:
+        """Successful posts in the local calendar day of `now_ts`.
 
-        Uses proper local datetime boundaries (calendar day 00:00:00 ->
-        00:00:00 next day), never a UTC/epoch 86400 chunk. `now_ts` defaults to
-        the real clock for backward compatibility; tests inject a fixed epoch.
+        Day boundaries are the actual local midnights of the containing date and
+        the next local date — never ``start + 86_400`` — so 23-hour (spring
+        forward) and 25-hour (fall back) local days are counted correctly.
+        ``tz`` defaults to the host local timezone (naive); pass an explicit
+        ``zoneinfo.ZoneInfo`` for deterministic tests. `now_ts` defaults to the
+        real clock for backward compatibility.
         """
-        from datetime import datetime
-
-        now = datetime.fromtimestamp(time.time() if now_ts is None else float(now_ts))
-        start = datetime(now.year, now.month, now.day, 0, 0, 0).timestamp()
-        end = start + 86400
+        start, end = local_day_bounds(
+            time.time() if now_ts is None else float(now_ts), tz=tz,
+        )
         with self._lock:
             row = self._conn.execute(
                 "SELECT COUNT(*) AS n FROM posts WHERE posted_at >= ? AND posted_at < ? AND status = 'posted'",

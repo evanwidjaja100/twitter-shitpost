@@ -12,14 +12,19 @@ Commands:
 import argparse
 import json
 import logging
+import logging.handlers
 import sys
 import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+import retention
+
 BASE = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE))
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
 def load_config() -> dict:
@@ -31,24 +36,64 @@ def load_config() -> dict:
 
 
 def setup_logging(cfg: dict):
+    """Configure bounded log files (bot.log + alerts.log) and stdout.
+
+    Size-bounded rotation keeps disk use bounded on a long-running daemon,
+    independent of uptime. Idempotent: calling it more than once never adds
+    duplicate handlers, so messages are never duplicated.
+    """
     log_dir = Path(str(BASE / cfg["paths"]["logs_dir"]))
     log_dir.mkdir(parents=True, exist_ok=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[
-            logging.FileHandler(log_dir / "bot.log", encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+    max_bytes, backups = retention.log_settings(cfg)
+    fmt = logging.Formatter(LOG_FORMAT)
+
+    root = logging.getLogger()
+    if not any(
+        isinstance(h, logging.FileHandler)
+        and Path(getattr(h, "baseFilename", "")).name == "bot.log"
+        for h in root.handlers
+    ):
+        fh = logging.handlers.RotatingFileHandler(
+            str(log_dir / "bot.log"), maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
+        )
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    if not any(
+        isinstance(h, logging.StreamHandler) for h in root.handlers
+    ):
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
+    root.setLevel(logging.INFO)
+
+
+def _alerts_handler(cfg: dict):
+    log_dir = Path(str(BASE / cfg["paths"]["logs_dir"]))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    max_bytes, backups = retention.log_settings(cfg)
+    return logging.handlers.RotatingFileHandler(
+        str(log_dir / "alerts.log"), maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
     )
 
 
 def alert(cfg: dict, message: str):
-    log_dir = Path(str(BASE / cfg["paths"]["logs_dir"]))
-    log_dir.mkdir(parents=True, exist_ok=True)
-    with open(log_dir / "alerts.log", "a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
-    logging.getLogger("alert").error(message)
+    """Append a timestamped alert to the bounded alerts.log.
+
+    Writes through the rotating "alerts" logger (same maxBytes/backupCount as
+    bot.log) so alerts.log stays bounded; the message also propagates to the
+    normal bot.log/stdout handlers like before.
+    """
+    logger = logging.getLogger("alerts")
+    if not any(
+        isinstance(h, logging.FileHandler)
+        and Path(getattr(h, "baseFilename", "")).name == "alerts.log"
+        for h in logger.handlers
+    ):
+        h = _alerts_handler(cfg)
+        h.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.addHandler(h)
+        logger.setLevel(logging.INFO)
+    logger.error(message)
 
 
 def _best_effort_alert(cfg: dict, message: str, log=None):
@@ -238,6 +283,11 @@ def mark_item_published(db, item) -> None:
 
 
 # ------------------------------------------------------------- commands
+
+# Last disk-maintenance timestamp (module-local: the daemon is single-process
+# and single-threaded, so an in-memory state is sufficient; the throttle keeps
+# cleanup to at most once per configured interval).
+_RETENTION_STATE: dict = {}
 
 def cmd_login():
     import login
@@ -514,6 +564,12 @@ def _daemon_iteration(cfg, db, session):
     log = logging.getLogger("daemon")
     posting = cfg["posting"]
     safety = cfg["safety"]
+
+    # Disk maintenance runs at a safe point (no media operation is active and
+    # the publishing/browser locks are held) and is throttled to at most once
+    # per configured interval. It is best-effort: failures are logged by
+    # retention.maybe_run_retention and can never interrupt posting.
+    retention.maybe_run_retention(BASE, cfg, _RETENTION_STATE)
 
     maybe_check_followers(db, cfg, session)
     times = scheduler.remaining_slots(
