@@ -12,11 +12,27 @@ $base = "D:\Desktop\test\twitter shitpost"
 #
 # Execution model:
 #   Execute   = cmd.exe
-#   Arguments = /c "<pythonw>" "<main.py>" daemon >> "<out>" 2>> "<err>"
+#   Arguments = /d /s /c ""<pythonw>" "<main.py>" daemon >> "<out>" 2>> "<err>""
 # i.e. the executable is cmd.exe and the argument string is the full
-# cmd.exe command line starting with its /c flag.  Never "cmd /c ...", which
-# would make Windows try to run "cmd.exe cmd /c ..." (cmd would treat the
-# second "cmd" as a program name and fail to start the daemon).
+# cmd.exe command line.  The leading /d disables AutoRun interference, /s
+# gives predictable processing of the /c string, and /c executes the command.
+# The ENTIRE command after /c is wrapped in one outer pair of double quotes so
+# every inner path (pythonw, main.py, both logs) can contain spaces.  This is
+# required: cmd.exe's bare `/c "a" "b" ...` form cannot reliably distinguish
+# the quoted tokens when paths contain spaces, so it is never used here.
+# Never "cmd /c ...", which would make Windows run "cmd.exe cmd /c ..." (cmd
+# would treat the second "cmd" as a program name and fail to start the daemon).
+function New-DaemonCmdArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ScriptPath,
+        [Parameter(Mandatory = $true)][string]$StdoutPath,
+        [Parameter(Mandatory = $true)][string]$StderrPath
+    )
+    $inner = "`"$PythonPath`" `"$ScriptPath`" daemon >> `"$StdoutPath`" 2>> `"$StderrPath`""
+    return "/d /s /c `"$inner`""
+}
+
 function New-BotScheduledTaskAction {
     param(
         [string]$BasePath = $base,
@@ -28,7 +44,8 @@ function New-BotScheduledTaskAction {
     $script = Join-Path $absBase $ScriptRel
     $logOut = Join-Path $absBase "logs\daemon_out.log"
     $logErr = Join-Path $absBase "logs\daemon_err.log"
-    $argLine = "/c `"$py`" `"$script`" daemon >> `"$logOut`" 2>> `"$logErr`""
+    $argLine = New-DaemonCmdArguments -PythonPath $py -ScriptPath $script `
+        -StdoutPath $logOut -StderrPath $logErr
     New-ScheduledTaskAction -Execute "cmd.exe" -Argument $argLine -WorkingDirectory $absBase
 }
 
