@@ -86,17 +86,19 @@ def _unlink_file(path: Path):
 
 
 def _unlink_tree(path: Path):
-    # Python 3.14 removed the follow_symlinks kwarg from rmtree, so delete the
-    # tree manually. os.walk never descends into symlinked dirs, and symlinked
-    # entries are unlinked (not traversed), so a stale temp dir can never pull
-    # in targets outside the managed tree.
+    """Delete a directory tree without following symlinks.
+
+    Raises on a real deletion failure (e.g. a locked child file or a directory
+    that cannot be emptied) so the caller can tell the difference between
+    "removed" and "still present". ``FileNotFoundError`` is tolerated: it only
+    means another process already removed the entry, which is a benign race.
+    """
     for root, dirs, files in os.walk(path, topdown=False):
         r = Path(root)
         for name in files:
-            entry = r / name
             try:
-                entry.unlink()
-            except OSError:
+                (r / name).unlink()
+            except FileNotFoundError:
                 pass
         for name in dirs:
             entry = r / name
@@ -105,11 +107,11 @@ def _unlink_tree(path: Path):
                     entry.unlink()
                 else:
                     entry.rmdir()
-            except OSError:
+            except FileNotFoundError:
                 pass
     try:
         path.rmdir()
-    except OSError:
+    except FileNotFoundError:
         pass
 
 
@@ -148,15 +150,28 @@ def _try_remove_file(path: Path, stats: dict) -> bool:
 
 
 def _try_remove_tree(path: Path, stats: dict) -> bool:
+    """Remove a stale temp dir; True only if it is actually gone afterwards.
+
+    A deletion that fails partway (locked child, non-empty dir) raises from
+    ``_unlink_tree``; that failure is counted and False returned so the caller
+    does not claim the directory was freed. ``FileNotFoundError`` means another
+    process already removed the path — that is a success, not an error. The
+    actual filesystem state is verified as a final guard, so a helper that
+    returned without error cannot be mistaken for a real removal.
+    """
     try:
         _unlink_tree(path)
-        return True
     except FileNotFoundError:
-        return True
+        return True  # already gone: another process cleaned it first
     except OSError as e:
         stats["errors"] += 1
-        log.debug("retention: could not remove tree %s: %s", path, e)
+        log.warning("retention: could not remove stale temp directory %s: %s", path, e)
         return False
+    if path.exists() or path.is_symlink():
+        stats["errors"] += 1
+        log.warning("retention: stale temp directory %s still present after removal", path)
+        return False
+    return True
 
 
 def _walk(root: Path, media_cutoff: float, temp_cutoff: float, stats: dict) -> None:

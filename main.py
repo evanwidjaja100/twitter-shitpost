@@ -27,6 +27,21 @@ sys.path.insert(0, str(BASE))
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
 
+def _is_stdout_handler(h) -> bool:
+    """Whether `h` is a real console handler writing to sys.stdout.
+
+    RotatingFileHandler/FileHandler are subclasses of StreamHandler, so checking
+    ``isinstance(h, logging.StreamHandler)`` alone would mistake the bot.log
+    file handler for a console handler. A genuine console handler targets
+    sys.stdout and is not a file handler.
+    """
+    return (
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        and getattr(h, "stream", None) is sys.stdout
+    )
+
+
 def load_config() -> dict:
     cfg_path = BASE / "config.json"
     if not cfg_path.exists():
@@ -58,9 +73,7 @@ def setup_logging(cfg: dict):
         )
         fh.setFormatter(fmt)
         root.addHandler(fh)
-    if not any(
-        isinstance(h, logging.StreamHandler) for h in root.handlers
-    ):
+    if not any(_is_stdout_handler(h) for h in root.handlers):
         sh = logging.StreamHandler(sys.stdout)
         sh.setFormatter(fmt)
         root.addHandler(sh)

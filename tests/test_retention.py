@@ -275,3 +275,146 @@ class TestSummariesAndThrottle:
         )
         res = retention.maybe_run_retention(tmp_path, _cfg(tmp_path), {}, now=NOW)
         assert res["skipped"] == "error"
+
+
+class TestTreeDeletionReporting:
+    """Reported stats must match actual filesystem outcomes for .ytdl_* dirs.
+
+    A partial/failed tree deletion must NOT be reported as temp_removed with
+    the full dir size claimed freed. Previously _unlink_tree swallowed child
+    unlink/rmdir errors and returned normally, so the caller incrmented
+    temp_removed/bytes_freed even though the directory still existed.
+    """
+
+    def _stale_ytdl(self, root: Path, name: str, child_size: int = 10):
+        work = (root / "assets" / name)
+        work.mkdir(parents=True)
+        child = work / "clip.mp4"
+        child.write_bytes(b"y" * child_size)
+        os.utime(work, (NOW - 3 * DAY, NOW - 3 * DAY))
+        return work, child
+
+    def test_a_child_permission_error_reports_failure(self, tmp_path, monkeypatch):
+        a = _assets(tmp_path)
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_bad")
+        size = child.stat().st_size
+
+        real_unlink = Path.unlink
+        def locked_child(self, *args, **kwargs):
+            if self.name == "clip.mp4":
+                raise PermissionError("locked child")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", locked_child)
+        s = _run(tmp_path)
+
+        assert work.exists() and child.exists()          # actually retained
+        assert s["temp_removed"] == 0                    # not counted as removed
+        assert s["bytes_freed"] == 0                     # full dir not claimed
+        assert s["errors"] >= 1                          # failure surfaced
+
+    def test_b_cleanup_continues_after_one_failure(self, tmp_path, monkeypatch):
+        a = _assets(tmp_path)
+        bad, bad_child = self._stale_ytdl(tmp_path, ".ytdl_bad")
+        good, good_child = self._stale_ytdl(tmp_path, ".ytdl_good")
+        good_size = good_child.stat().st_size
+
+        real_unlink = Path.unlink
+        def locked_bad(self, *args, **kwargs):
+            if self.name.startswith("clip.mp4") and ".ytdl_bad" in str(self):
+                raise PermissionError("locked child")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", locked_bad)
+        s = _run(tmp_path)
+
+        assert bad.exists() and bad_child.is_file()      # bad retained
+        assert not good.exists()                         # good removed
+        assert s["errors"] >= 1                          # one failure
+        assert s["temp_removed"] == 1                    # only good counted
+        assert s["bytes_freed"] == good_size             # only good bytes
+
+    def test_c_successful_dir_removal_reports_truthfully(self, tmp_path):
+        a = _assets(tmp_path)
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_ok")
+        size = child.stat().st_size
+        s = _run(tmp_path)
+        assert not work.exists()
+        assert s["temp_removed"] == 1
+        assert s["bytes_freed"] == size
+        assert s["errors"] == 0
+
+    def test_d_disappearing_child_race_is_harmless(self, tmp_path, monkeypatch):
+        a = _assets(tmp_path)
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_race")
+
+        real_unlink = Path.unlink
+        def vanished(self, *args, **kwargs):
+            if self.name == "clip.mp4":
+                real_unlink(self, *args, **kwargs)   # another process wins first
+                raise FileNotFoundError("already gone")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", vanished)
+        s = _run(tmp_path)
+
+        assert not work.exists()                       # whole target ultimately gone
+        assert s["temp_removed"] == 1
+        assert s["errors"] == 0                        # race is not an error
+
+    def test_e_root_rmdir_failure_reports_failure(self, tmp_path, monkeypatch):
+        a = _assets(tmp_path)
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_rmdir")
+        # child unlinks fine; only the final path.rmdir() is blocked.
+        real_rmdir = Path.rmdir
+        def blocked_rmdir(self, *args, **kwargs):
+            if self.name == ".ytdl_rmdir":
+                raise PermissionError("locked root dir")
+            return real_rmdir(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "rmdir", blocked_rmdir)
+        s = _run(tmp_path)
+
+        assert work.exists()
+        assert not child.exists()                      # children were removed
+        assert s["temp_removed"] == 0                # dir not fully removed
+        assert s["bytes_freed"] == 0
+        assert s["errors"] >= 1
+
+    def test_f_symlink_target_untouched_by_tree_removal(self, tmp_path, monkeypatch):
+        if not hasattr(os, "symlink"):
+            pytest.skip("symlinks unsupported on this platform")
+        a = _assets(tmp_path)
+        outside = tmp_path / "outside"
+        outside.mkdir(exist_ok=True)
+        target = outside / "keep.txt"
+        target.write_bytes(b"precious")
+        try:
+            (a / "link.jpg").symlink_to(target)
+        except OSError:
+            pytest.skip("cannot create symlinks on this host")
+        s = _run(tmp_path)
+        assert target.read_bytes() == b"precious"   # external target untouched
+        assert (a / "link.jpg").exists()            # symlink itself untouched
+
+    def test_g_successful_dir_removal_returns_true_helper_contract(self, tmp_path):
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_contract")
+        stats = {"media_removed": 0, "temp_removed": 0, "bytes_freed": 0, "errors": 0}
+        assert retention._try_remove_tree(work, stats) is True
+        assert not work.exists()
+        assert stats["errors"] == 0
+
+    def test_g_failed_dir_removal_returns_false_helper_contract(self, tmp_path, monkeypatch):
+        work, child = self._stale_ytdl(tmp_path, ".ytdl_contract_fail")
+        real_unlink = Path.unlink
+
+        def locked_child(self, *args, **kwargs):
+            if self.name == "clip.mp4":
+                raise PermissionError("locked child")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", locked_child)
+        stats = {"media_removed": 0, "temp_removed": 0, "bytes_freed": 0, "errors": 0}
+        assert retention._try_remove_tree(work, stats) is False
+        assert work.exists()
+        assert stats["errors"] == 1
