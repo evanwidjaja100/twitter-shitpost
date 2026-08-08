@@ -1,11 +1,15 @@
 """TikTok scraper — browses TikTok with the bot's browser, no API, no approval.
 
-Two modes, driven by config:
-  * Account mode  — visit curated @handles' profile grids (niche content).
+Two modes, driven by config (they are ADDITIVE — both run when enabled):
   * Feed mode     — scroll the general "For You" feed (no accounts needed).
+  * Account mode  — visit curated @handles' profile grids (niche content).
 
 Both return the same item schema; main.py downloads each video downstream via
 yt-dlp. All selectors live here so they're a single point of maintenance.
+
+Metadata correctness: every feed video's like count, description and URL are
+read from the SAME card/container element, never from page-global ``.first``
+selectors, so candidates in one feed cannot exchange metadata.
 """
 
 import logging
@@ -20,6 +24,11 @@ _VIDEO_LINK_RE = re.compile(r"/(?:@[^/]+/)?video/(\d+)")
 # Feed mode loads roughly one video per viewport and virtualizes the list, so we
 # scroll generously and stop once we've collected enough unique videos.
 _FEED_SCROLL_MULTIPLIER = 3
+
+# A logical feed card: the container that owns one video link + its own
+# like-count + description together. Kept as the single scoping selector so
+# per-video metadata never leaks across cards.
+_CARD = '[data-e2e="feed-item"], [data-e2e="video-card"]'
 
 
 def _parse_count(text) -> int:
@@ -49,80 +58,69 @@ def _card(href: str, likes: int, caption: str) -> dict:
     }
 
 
+def _extract_feed_card(card) -> dict | None:
+    """Extract one logical feed/source entry STRICTLY from its own card element.
+
+    The video link, like count and description are all read from the SAME card
+    locator, so two videos in one feed can never exchange metadata. A card
+    missing any part yields an empty value for that part (it never borrows
+    another card's).
+    """
+    try:
+        a = card.locator('a[href*="/video/"]').first
+        href = a.get_attribute("href") or "" if a.count() else ""
+        if not _VIDEO_LINK_RE.search(href):
+            return None
+
+        likes = 0
+        lik = card.locator('[data-e2e="like-count"]').first
+        if lik.count():
+            likes = _parse_count(lik.inner_text(timeout=1500))
+
+        caption = ""
+        desc = card.locator('[data-e2e="video-card-desc"], [data-e2e="video-desc"]').first
+        if desc.count():
+            caption = desc.inner_text(timeout=1500).strip()[:200]
+
+        return _card(href, likes, caption)
+    except Exception as e:
+        log.debug("tiktok feed card parse skipped: %s", e)
+        return None
+
+
 def _collect_cards(page, limit: int) -> list[dict]:
     """Return [{'id','href','likes','caption'}...] for visible video cards.
 
-    Profile-grid mode: each card renders one <a href=\".../video/ID\"> and one
-    like badge (data-e2e=\"like-count\") in the same DOM order, so we zip them.
-    Unreadable counts fall back to 0 (still postable when min_likes is 0).
+    Every card is scoped: its link, like count and description are read from
+    the SAME container, so metadata cannot attach to the wrong video.
     """
-    links: list[dict] = []
+    cards: list[dict] = []
     seen: set[str] = set()
-    for a in page.locator('a[href*="/video/"]').all():
-        try:
-            href = a.get_attribute("href") or ""
-            if not _VIDEO_LINK_RE.search(href) or href in seen:
-                continue
-            seen.add(href)
-            links.append(href)
-        except Exception as e:
-            log.debug("tiktok link parse skipped: %s", e)
-
-    like_counts: list[int] = []
-    for el in page.locator('[data-e2e="like-count"]').all():
-        try:
-            like_counts.append(_parse_count(el.inner_text(timeout=1000)))
-        except Exception:
-            like_counts.append(0)
-
-    captions: list[str] = []
-    for el in page.locator('[data-e2e="video-card-desc"]').all():
-        try:
-            captions.append(el.inner_text(timeout=1000).strip()[:200])
-        except Exception:
-            captions.append("")
-
-    return [
-        _card(
-            href,
-            like_counts[i] if i < len(like_counts) else 0,
-            captions[i] if i < len(captions) else "",
-        )
-        for i, href in enumerate(links[: limit * 4])
-    ]
+    for el in page.locator(_CARD).all():
+        item = _extract_feed_card(el)
+        if item is None or item["id"] in seen:
+            continue
+        seen.add(item["id"])
+        cards.append(item)
+        if len(cards) >= limit:
+            break
+    return cards
 
 
 def _collect_feed(page, max_posts: int, scrolls: int) -> list[dict]:
-    """Scroll the For You feed, collecting one link + like count per viewport."""
+    """Scroll the For You feed, collecting per-card metadata for each video."""
     cards: list[dict] = []
     seen: set[str] = set()
     probes = max(scrolls * _FEED_SCROLL_MULTIPLIER, 8)
     for _ in range(probes):
-        for a in page.locator('a[href*="/video/"]').all():
-            try:
-                href = a.get_attribute("href") or ""
-                if not _VIDEO_LINK_RE.search(href) or href in seen:
-                    continue
-                seen.add(href)
-                likes = 0
-                caption = ""
-                try:
-                    lik = page.locator('[data-e2e="like-count"]').first
-                    if lik.count():
-                        likes = _parse_count(lik.inner_text(timeout=1500))
-                except Exception:
-                    pass
-                try:
-                    desc = page.locator('[data-e2e="video-desc"]').first
-                    if desc.count():
-                        caption = desc.inner_text(timeout=1500).strip()[:200]
-                except Exception:
-                    pass
-                cards.append(_card(href, likes, caption))
-            except Exception as e:
-                log.debug("tiktok feed parse skipped: %s", e)
-        if len(cards) >= max_posts:
-            break
+        for el in page.locator(_CARD).all():
+            item = _extract_feed_card(el)
+            if item is None or item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            cards.append(item)
+            if len(cards) >= max_posts:
+                return cards
         try:
             page.mouse.wheel(0, 3000)
         except Exception:
@@ -151,12 +149,14 @@ def _to_item(card: dict, handle: str, min_likes: int) -> dict | None:
 def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     """Collect top video candidates from TikTok.
 
-    Scrapes the general For You feed when `foryou` is enabled OR no accounts are
-    configured; otherwise browses each configured @handle's profile grid.
+    For You and configured accounts are treated as ADDITIVE — matching the
+    documented behavior (README: accounts are "used when `foryou` is `false`,
+    or in addition"): when ``foryou`` is enabled the general feed is collected
+    AND every configured account is browsed; the final list is deduplicated by
+    video id. Empty accounts + ``foryou=false`` falls back to the feed.
     """
-    accounts = config.get("accounts", [])
+    accounts = [a for a in config.get("accounts", []) if a]
     foryou = bool(config.get("foryou", False))
-    use_feed = foryou or not accounts
     min_likes = int(config.get("min_likes", 0))
     max_posts = int(config.get("max_posts_per_account", 10))
     scrolls = int(config.get("scrolls", 3))
@@ -166,7 +166,7 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     context = session._context
     page = context.new_page()
     try:
-        if use_feed:
+        if foryou or not accounts:
             try:
                 page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(4000)
@@ -181,6 +181,8 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                     continue
                 seen_ids.add(card["id"])
                 items.append(item)
+
+        if not accounts:
             return items
 
         for handle in accounts:
@@ -219,4 +221,3 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
         except Exception:
             pass
     return items
-

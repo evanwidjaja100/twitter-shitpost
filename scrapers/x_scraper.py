@@ -90,7 +90,7 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                         link = a.get_attribute("href") or ""
 
                     media_urls = _post_media(article)
-                    if likes < min_likes and not media_urls:
+                    if likes < min_likes:
                         continue
                     if not link:
                         continue
@@ -127,8 +127,15 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     return items
 
 
-def download_media(session, item: dict, dest_dir: str) -> str | None:
-    """Download item media using the session's cookies. Returns local path or None."""
+def download_media(session, item: dict, dest_dir: str, max_bytes: int | None = None) -> str | None:
+    """Download item media using the session's cookies.
+
+    ``max_bytes`` is an authoritative ceiling: an oversized Content-Length is
+    rejected before ``resp.body()`` is ever read, and the body itself is
+    validated against the limit before anything is written to disk. A media
+    response that cannot be proven within the limit is never returned.
+    Returns local path or None.
+    """
     url = item.get("media_url")
     if not url:
         return None
@@ -145,7 +152,29 @@ def download_media(session, item: dict, dest_dir: str) -> str | None:
         if not resp.ok:
             log.warning("media download %s -> %s", url, resp.status)
             return None
-        out.write_bytes(resp.body())
+
+        if max_bytes is not None:
+            cl = resp.headers.get("content-length") or resp.headers.get("Content-Length")
+            if cl is not None:
+                try:
+                    if int(cl) > max_bytes:
+                        log.warning(
+                            "media download rejected: %s Content-Length %s exceeds %d",
+                            url, cl, max_bytes,
+                        )
+                        return None
+                except ValueError:
+                    pass  # malformed header; real body length is checked below
+
+        body = resp.body()
+        if max_bytes is not None and len(body) > max_bytes:
+            log.warning(
+                "media download rejected: %s body %d bytes exceeds %d",
+                url, len(body), max_bytes,
+            )
+            return None
+
+        out.write_bytes(body)
         return str(out)
     except Exception as e:
         log.warning("media download failed: %s", e)

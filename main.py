@@ -83,6 +83,8 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
     src_dir.mkdir(parents=True, exist_ok=True)
 
     clip_max = cfg["youtube"]["clip_max_seconds"]
+    max_image_bytes = cfg["posting"]["max_image_bytes"]
+    max_video_bytes = cfg["posting"]["max_video_bytes"]
 
     try:
         if item["media_path"]:  # already downloaded (demo)
@@ -90,18 +92,23 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
         elif item["source"] == "x" and item["media_url"]:
             from scrapers.x_scraper import download_media
 
-            src = download_media(session, item, str(src_dir))
+            max_bytes = max_video_bytes if item["kind"] == "video" else max_image_bytes
+            src = download_media(session, item, str(src_dir), max_bytes=max_bytes)
             if not src:
                 return None
         elif item["kind"] == "video":
             src = m.ytdl_download(
                 item["source_url"],
                 str(src_dir),
-                cfg["posting"]["max_video_bytes"],
+                max_video_bytes,
                 ffmpeg_dir=str(BASE / paths["ffmpeg"]).rsplit("/", 1)[0],
             )
         elif item["kind"] == "image":
-            src = m.download(item["media_url"], str(src_dir / f"{item['source_id']}_raw"))
+            src = m.download(
+                item["media_url"],
+                str(src_dir / f"{item['source_id']}_raw"),
+                max_bytes=max_image_bytes,
+            )
         else:
             return None
     except m.MediaError as e:
@@ -110,10 +117,10 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
 
     try:
         if item["kind"] == "image":
-            out = m.prepare_image(src, str(src_dir), cfg["posting"]["max_image_bytes"])
+            out = m.prepare_image(src, str(src_dir), max_image_bytes)
             if not image_passes_dims(out, 0, 0):
                 return None
-            return out
+            return m.validate_final_media_size(out, "image", max_image_bytes, max_video_bytes)
         else:  # video
             if item["source"] == "x":
                 try:
@@ -121,10 +128,18 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
                 except m.MediaError:
                     return None
                 if dur <= clip_max:
-                    return src
-            return m.trim_video(
-                src, str(src_dir), ffmpeg, ffprobe, clip_max,
-                cfg["youtube"]["clip_min_seconds"],
+                    # Duration alone is NOT a byte-limit guarantee: the actual
+                    # file size must already fit, else the source may not be
+                    # returned untouched.
+                    if Path(src).stat().st_size <= max_video_bytes:
+                        return m.validate_final_media_size(src, "video", max_image_bytes, max_video_bytes)
+            return m.validate_final_media_size(
+                m.trim_video(
+                    src, str(src_dir), ffmpeg, ffprobe, clip_max,
+                    cfg["youtube"]["clip_min_seconds"],
+                    max_bytes=max_video_bytes,
+                ),
+                "video", max_image_bytes, max_video_bytes,
             )
     except m.MediaError as e:
         logging.getLogger("select").warning("prepare failed: %s", e)
