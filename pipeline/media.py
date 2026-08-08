@@ -1,8 +1,9 @@
 import hashlib
 import json
 import logging
-import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import requests
@@ -48,8 +49,16 @@ def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAU
 
     ``max_bytes`` is an absolute safety budget: the running streamed byte count
     is authoritative (Content-Length may be absent, wrong, or chunked), and the
-    download is aborted the moment it is exceeded. The partial file is removed
-    on any failure, never left behind.
+    download is aborted the moment it is exceeded.
+
+    The body is written to ``<dest>.part`` first and only atomically renamed to
+    the final ``dest`` after the whole transfer (and the byte ceiling) has been
+    validated, so a partially written file never appears at the final path.
+    Cleanup is structurally guaranteed via ``finally``: on ANY failure —
+    request/network error, size overflow, file-open failure, or a filesystem
+    write/flush ``OSError`` during transfer — the ``.part`` file is removed and
+    a :class:`MediaError` is raised with the original exception as its cause.
+    A pre-existing valid destination is never touched by a failed run.
 
     Content-Length is used only as an early-rejection optimisation (rejected
     immediately when present and over the ceiling); it is never trusted as the
@@ -57,9 +66,12 @@ def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAU
     for authenticated streams; it is never logged.
     """
     dest = Path(dest_path)
+    part = dest.parent / f"{dest.name}.part"
     headers = {"User-Agent": USER_AGENT}
     if referer:
         headers["Referer"] = referer
+    _remove_if_exists(part)  # clear any stale partial from a previous failed run
+    success = False
     try:
         with requests.get(url, headers=headers, stream=True, timeout=timeout,
                           allow_redirects=True, cookies=cookies) as r:
@@ -70,11 +82,11 @@ def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAU
                     try:
                         if int(cl) > max_bytes:
                             log.warning("rejecting download: %s Content-Length %s exceeds %d", url, cl, max_bytes)
-                            return _abort_download(dest, f"Content-Length {cl} exceeds {max_bytes} byte limit for {url}")
+                            raise MediaError(f"Content-Length {cl} exceeds {max_bytes} byte limit for {url}")
                     except ValueError:
                         pass  # malformed Content-Length; streaming counter is authoritative
             written = 0
-            with open(dest, "wb") as f:
+            with open(part, "wb") as f:
                 for chunk in r.iter_content(DOWNLOAD_CHUNK):
                     if not chunk:
                         continue
@@ -83,21 +95,22 @@ def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAU
                         log.warning("aborting download after exceeding %d bytes: %s", max_bytes, url)
                         raise MediaError(f"download exceeded {max_bytes} byte limit for {url}")
                     f.write(chunk)
+                f.flush()
+        part.replace(dest)  # atomic rename: partial is never visible at the final path
+        success = True
+        if not dest.exists() or dest.stat().st_size == 0:
+            _remove_if_exists(dest)
+            raise MediaError(f"empty download for {url}")
     except requests.RequestException as e:
-        _remove_if_exists(dest)
         raise MediaError(f"download failed for {url}: {e}") from e
     except MediaError:
-        _remove_if_exists(dest)
         raise
-    if not dest.exists() or dest.stat().st_size == 0:
-        _remove_if_exists(dest)
-        raise MediaError(f"empty download for {url}")
+    except OSError as e:
+        raise MediaError(f"media download write failed for {url}: {e}") from e
+    finally:
+        if not success:
+            _remove_if_exists(part)
     return dest_path
-
-
-def _abort_download(dest: Path, message: str) -> str:
-    _remove_if_exists(dest)
-    raise MediaError(message)
 
 
 def prepare_image(src_path: str, dest_dir: str, max_bytes: int) -> str:
@@ -201,19 +214,86 @@ def video_duration(ffprobe: str, path: str) -> float:
     raise MediaError(f"cannot determine duration for {path}")
 
 
+_YTDLP_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v")
+
+
+def _resolve_ytdl_output(info: dict, ydl, work: Path, url: str) -> Path:
+    """Identify the ONE actual output file produced by this yt-dlp invocation.
+
+    yt-dlp records the final downloaded/postprocessed path in
+    ``requested_downloads[*]['filepath']`` and the top-level ``filepath`` field;
+    those are authoritative and take priority over any filesystem guessing. If
+    no such path exists, ``prepare_filename`` and a directory scan are used —
+    but every fallback is restricted to ``work``, a fresh per-operation
+    temporary directory, so a stale pre-existing same-ID file from an earlier
+    run can never be selected. When more than one plausible current output
+    remains, the operation fails safely with :class:`MediaError` rather than
+    guessing.
+    """
+    meta = []
+    seen = set()
+    for entry in (info.get("requested_downloads") or []):
+        fp = entry.get("filepath")
+        if fp and fp not in seen:
+            seen.add(fp)
+            p = Path(fp)
+            if p.is_file():
+                meta.append(p)
+    fp = info.get("filepath")
+    if fp and fp not in seen:
+        seen.add(fp)
+        p = Path(fp)
+        if p.is_file():
+            meta.append(p)
+    if meta:
+        if len(meta) == 1:
+            return meta[0]
+        raise MediaError(
+            f"yt-dlp output for {url} is ambiguous: {', '.join(str(p) for p in meta)}"
+        )
+
+    try:
+        template_path = Path(ydl.prepare_filename(info))
+    except Exception:
+        template_path = None
+    if template_path is not None and template_path.is_file():
+        return template_path
+
+    files = sorted(
+        p for p in work.iterdir()
+        if p.is_file() and p.suffix.lower() in _YTDLP_MEDIA_SUFFIXES
+    )
+    if not files:
+        raise MediaError(f"yt-dlp produced no output file for {url}")
+    if len(files) == 1:
+        return files[0]
+    raise MediaError(
+        f"yt-dlp output for {url} is ambiguous: {', '.join(str(p) for p in files)}"
+    )
+
+
 def ytdl_download(url: str, dest_dir: str, max_bytes: int, ffmpeg_dir: str = None) -> str:
     """Download a video via yt-dlp. Returns path to downloaded file.
 
+    Downloads run inside a NEW, per-operation temporary directory under
+    ``dest_dir`` so the current output can never be confused with a stale
+    pre-existing same-ID file from an earlier run. The actual produced file is
+    identified from yt-dlp's own returned metadata first, and otherwise only
+    from files inside that fresh temp directory.
+
     ``max_filesize`` is passed to yt-dlp as an early guard/optimisation ONLY.
-    The actual filesystem size of the real downloaded (possibly
-    postprocessed/merged) file is authoritative: if it exceeds ``max_bytes``
-    the oversized output is deleted and a :class:`MediaError` is raised, so
-    yt-dlp ignoring the advisory limit cannot produce an oversized source.
+    The real filesystem size of the actual current output is authoritative: if
+    it exceeds ``max_bytes`` the whole temp directory (including any oversized
+    output, ``.part`` fragments and merged intermediates) is removed and a
+    :class:`MediaError` is raised. Pre-existing files in the durable
+    destination are never touched by a failed or ambiguous run. On success the
+    validated file is atomically renamed into ``dest_dir``.
     """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=".ytdl_", dir=str(dest_dir)))
     opts = {
-        "outtmpl": str(dest_dir / "%(id)s.%(ext)s"),
+        "outtmpl": str(work / "%(id)s.%(ext)s"),
         "format": "best[ext=mp4]/best",
         "quiet": True,
         "no_warnings": True,
@@ -226,31 +306,21 @@ def ytdl_download(url: str, dest_dir: str, max_bytes: int, ffmpeg_dir: str = Non
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            path = ydl.prepare_filename(info)
+        final = _resolve_ytdl_output(info, ydl, work, url)
+        size = final.stat().st_size
+        if max_bytes is not None and size > max_bytes:
+            log.warning("rejecting yt-dlp output %s: %d bytes exceeds %d byte limit",
+                        final, size, max_bytes)
+            raise MediaError(f"yt-dlp output for {url} exceeds {max_bytes} byte video limit")
+        out = dest_dir / final.name
+        final.replace(out)  # atomic; current output overwrites any same-name stale file
+        return str(out)
     except Exception as e:
+        if isinstance(e, MediaError):
+            raise
         raise MediaError(f"yt-dlp failed for {url}: {e}") from e
-
-    final = Path(path)
-    if not final.exists():
-        # yt-dlp may rename/merge streams / change extensions; validate the REAL
-        # resulting file, not the initially requested template name.
-        candidates = [c for c in dest_dir.glob(f"{info.get('id', '')}.*") if c.is_file()]
-        media_suffixes = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v")
-        videos = [c for c in candidates if c.suffix.lower() in media_suffixes]
-        pool = videos or candidates
-        if not pool:
-            raise MediaError(f"yt-dlp produced no file for {url}")
-        final = max(pool, key=lambda p: p.stat().st_size)
-
-    size = final.stat().st_size
-    if max_bytes is not None and size > max_bytes:
-        log.warning("rejecting yt-dlp output %s: %d bytes exceeds %d byte limit",
-                    final, size, max_bytes)
-        _remove_if_exists(final)
-        for part in final.parent.glob(f"{final.stem}.part*"):
-            _remove_if_exists(part)
-        raise MediaError(f"yt-dlp output for {url} exceeds {max_bytes} byte video limit")
-    return str(final)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def trim_video(src_path: str, dest_dir: str, ffmpeg: str, ffprobe: str, max_seconds: float,

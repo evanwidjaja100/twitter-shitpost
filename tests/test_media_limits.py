@@ -122,6 +122,153 @@ def test_download_raises_on_http_error(tmp_path):
     assert not dest.exists()
 
 
+# ---- Defect A: filesystem write/open failures never leave a partial file ----
+
+class _FlakyWriter:
+    """Wraps a real file so ``write`` fails on the Nth call with OSError."""
+
+    def __init__(self, real_file, fail_on_write=2):
+        self._f = real_file
+        self._n = 0
+        self._fail_on = fail_on_write
+
+    def write(self, data):
+        self._n += 1
+        if self._n == self._fail_on:
+            raise OSError("disk write failed")
+        return self._f.write(data)
+
+    def flush(self):
+        return self._f.flush()
+
+    def close(self):
+        return self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+def _flaky_open_wrapper(writer_cls=_FlakyWriter, **kw):
+    real_open = open
+
+    def _open(path, mode="r", *a, **k):
+        raw = real_open(path, mode, *a, **k)
+        return writer_cls(raw, **kw)
+
+    return _open
+
+
+# Test A — an OSError from f.write() leaves no partial file at any name.
+def test_download_write_error_removes_partial(tmp_path):
+    dest = tmp_path / "big.bin"
+    with mock.patch("builtins.open", _flaky_open_wrapper()), \
+         mock.patch("pipeline.media.requests.get",
+                    _stub_get(_FakeResp(body=b"a" * 64 * 3))):  # >= 2 chunks written
+        with pytest.raises(MediaError):
+            media.download("https://x/img", str(dest), max_bytes=100_000)
+    assert not dest.exists()
+    assert list(tmp_path.iterdir()) == []  # no .part leftover either
+
+
+# Test B: the write failure surfaces as MediaError with the OSError as cause.
+def test_download_write_error_preserves_cause(tmp_path):
+    dest = tmp_path / "big.bin"
+    with mock.patch("builtins.open", _flaky_open_wrapper()), \
+         mock.patch("pipeline.media.requests.get",
+                    _stub_get(_FakeResp(body=b"a" * 200))):
+        with pytest.raises(MediaError) as ei:
+            media.download("https://x/img", str(dest), max_bytes=100_000)
+    assert isinstance(ei.value.__cause__, OSError)
+    assert not (tmp_path / "big.bin.part").exists()
+
+
+# Test C: file-open failure (PermissionError) creates no output at all.
+def test_download_write_open_failure_no_output(tmp_path):
+    dest = tmp_path / "locked.bin"
+
+    def _deny_open(*a, **k):
+        raise PermissionError("denied")
+
+    with mock.patch("builtins.open", _deny_open), \
+         mock.patch("pipeline.media.requests.get", _stub_get(_FakeResp(body=b"a" * 64))):
+        with pytest.raises(MediaError) as ei:
+            media.download("https://x/img", str(dest), max_bytes=100_000)
+    assert isinstance(ei.value.__cause__, PermissionError)
+    assert not dest.exists()
+    assert not (tmp_path / "locked.bin.part").exists()
+
+
+# Test A2: a flush()/close failure also cleans up.
+def test_download_flush_failure_removes_partial(tmp_path):
+    class _FlushFail(_FlakyWriter):
+        def flush(self):
+            raise OSError("flush failed")
+
+    dest = tmp_path / "flush.bin"
+    with mock.patch("builtins.open", _flaky_open_wrapper(writer_cls=_FlushFail)), \
+         mock.patch("pipeline.media.requests.get",
+                    _stub_get(_FakeResp(body=b"a" * 64))):
+        with pytest.raises(MediaError):
+            media.download("https://x/img", str(dest), max_bytes=100_000)
+    assert not dest.exists()
+    assert not (tmp_path / "flush.bin.part").exists()
+
+
+# Test H: the final path is not visible while the transfer is incomplete.
+def test_download_final_path_not_visible_prematurely(tmp_path):
+    dest = tmp_path / "x.bin"
+    assert not dest.exists()
+
+    class _Slow(_FakeResp):
+        def iter_content(self, chunk_size):
+            yield b"a" * 64
+            raise OSError("device error")
+
+    with mock.patch("builtins.open", _flaky_open_wrapper(fail_on_write=2)), \
+         mock.patch("pipeline.media.requests.get", _stub_get(_Slow(body=b"a" * 300))):
+        with pytest.raises(MediaError):
+            media.download("https://x/img", str(dest), max_bytes=10_000)
+    assert not dest.exists()
+
+
+# Defect A / Test D: existing size-overflow cleanup still removes the partial.
+def test_download_size_overflow_still_cleans_partial(tmp_path):
+    dest = tmp_path / "grow.bin"
+    with mock.patch("pipeline.media.requests.get",
+                    _stub_get(_FakeResp(body=b"a" * 101))):
+        with pytest.raises(MediaError):
+            media.download("https://x/img", str(dest), max_bytes=100)
+    assert not dest.exists()
+    assert not (tmp_path / "grow.bin.part").exists()
+
+
+# Test F: a successful download leaves the final file byte-exact, no .part.
+def test_download_success_leaves_no_part(tmp_path):
+    dest = tmp_path / "ok.bin"
+    payload = bytes(range(256)) * 3
+    with mock.patch("pipeline.media.requests.get", _stub_get(_FakeResp(body=payload))):
+        got = media.download("https://x/img", str(dest), max_bytes=10_000)
+    assert got == str(dest)
+    assert dest.read_bytes() == payload
+    assert not (tmp_path / "ok.bin.part").exists()
+
+
+# A failed re-download does not destroy a pre-existing valid destination file.
+def test_download_failure_preserves_preexisting_destination(tmp_path):
+    dest = tmp_path / "keep.bin"
+    dest.write_bytes(b"precious")
+    with mock.patch("pipeline.media.requests.get",
+                    _stub_get(_FakeResp(body=b"a" * 300))):
+        with pytest.raises(MediaError):
+            media.download("https://x/img", str(dest), max_bytes=100)
+    assert dest.read_bytes() == b"precious"
+    assert not (tmp_path / "keep.bin.part").exists()
+
+
 # --------------------------------------------------------------- x download_media
 
 class _FakeXContext:
@@ -374,15 +521,22 @@ def test_validate_final_media_size(tmp_path):
 
 # ------------------------------------------------------------- yt-dlp size check
 
-def _ytdl_fake(dest_dir, files, info_id="vid123", template="vid123.mp4", captured=None):
-    """Build a fake YoutubeDL that writes ``files`` (name -> bytes) on download.
+def _ytdl_fake(files, info_id="vid123", template="vid123.mp4",
+               requested_filepaths=None, captured=None):
+    """Build a fake YoutubeDL that mirrors real yt-dlp behavior.
 
+    Files are written into the per-operation working directory derived from
+    ``opts['outtmpl']`` (exactly where real yt-dlp writes). ``requested_filepaths``
+    (optional) populates ``info['requested_downloads'][*]['filepath']`` — the
+    authoritative output metadata real yt-dlp returns after download + postprocessing.
     ``template`` is what ``prepare_filename`` returns (may differ from the real
-    written file, simulating yt-dlp renaming/merging). """
+    written file, simulating yt-dlp renaming/merging).
+    """
     class _FakeYDL:
         def __init__(self, opts):
             if captured is not None:
                 captured["opts"] = opts
+            self._dir = Path(opts["outtmpl"]).parent
 
         def __enter__(self):
             return self
@@ -392,11 +546,16 @@ def _ytdl_fake(dest_dir, files, info_id="vid123", template="vid123.mp4", capture
 
         def extract_info(self, url, download=True):
             for name, content in files.items():
-                (Path(dest_dir) / name).write_bytes(content)
-            return {"id": info_id, "title": "t"}
+                (self._dir / name).write_bytes(content)
+            info = {"id": info_id, "title": "t"}
+            if requested_filepaths is not None:
+                info["requested_downloads"] = [
+                    {"filepath": str(self._dir / name)} for name in requested_filepaths
+                ]
+            return info
 
         def prepare_filename(self, info):
-            return str(Path(dest_dir) / template)
+            return str(self._dir / template)
 
     return _FakeYDL
 
@@ -409,7 +568,7 @@ def _ytdl_run(fake, max_bytes, dest_dir):
 # yt-dlp Test (config): max_filesize remains configured.
 def test_ytdl_passes_max_filesize_option(tmp_path):
     captured = {}
-    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 10}, captured=captured)
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 10}, captured=captured)
     out = _ytdl_run(fake, 123456, tmp_path)
     assert captured["opts"]["max_filesize"] == 123456
     assert out == str(tmp_path / "vid123.mp4")
@@ -417,7 +576,7 @@ def test_ytdl_passes_max_filesize_option(tmp_path):
 
 # yt-dlp Test A — under limit accepted.
 def test_ytdl_under_limit_accepted(tmp_path):
-    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 80})
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 80})
     out = _ytdl_run(fake, 100, tmp_path)
     assert out == str(tmp_path / "vid123.mp4")
     assert (tmp_path / "vid123.mp4").stat().st_size == 80
@@ -425,14 +584,14 @@ def test_ytdl_under_limit_accepted(tmp_path):
 
 # yt-dlp Test B — exact boundary accepted.
 def test_ytdl_exact_boundary_accepted(tmp_path):
-    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 100})
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 100})
     out = _ytdl_run(fake, 100, tmp_path)
     assert out == str(tmp_path / "vid123.mp4")
 
 
 # yt-dlp Test C — max + 1 rejected and removed.
 def test_ytdl_max_plus_one_rejected_and_removed(tmp_path):
-    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 101})
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 101})
     with pytest.raises(MediaError):
         _ytdl_run(fake, 100, tmp_path)
     assert not (tmp_path / "vid123.mp4").exists()
@@ -442,7 +601,7 @@ def test_ytdl_max_plus_one_rejected_and_removed(tmp_path):
 def test_ytdl_ignored_max_filesize_still_caught(tmp_path):
     captured = {}
     # Fake receives max_filesize=100 but deliberately writes 101 bytes.
-    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 101}, captured=captured)
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 101}, captured=captured)
     with pytest.raises(MediaError):
         _ytdl_run(fake, 100, tmp_path)
     assert captured["opts"]["max_filesize"] == 100
@@ -453,28 +612,103 @@ def test_ytdl_ignored_max_filesize_still_caught(tmp_path):
 def test_ytdl_actual_merged_filename_validated(tmp_path):
     # prepare_filename points at a name that never materializes; the real merged
     # file has a different name, and that file's size is what is checked.
-    fake = _ytdl_fake(tmp_path, {"vid123.mkv": b"x" * 80}, template="vid123.mp4")
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 80}, template="vid123.mp4")
     out = _ytdl_run(fake, 100, tmp_path)
     assert out == str(tmp_path / "vid123.mkv")  # actual file returned, not template
 
-    fake_big = _ytdl_fake(tmp_path, {"vid123.mkv": b"x" * 101}, template="vid123.mp4")
+    # A later oversized current output must be removed, and must NOT replace the
+    # previously accepted file in the durable destination.
+    fake_big = _ytdl_fake({"vid123.mkv": b"x" * 101}, template="vid123.mp4")
     with pytest.raises(MediaError):
         _ytdl_run(fake_big, 100, tmp_path)
-    assert not (tmp_path / "vid123.mkv").exists()
+    assert (tmp_path / "vid123.mkv").read_bytes() == b"x" * 80  # previous file intact
+    assert not list(tmp_path.glob(".ytdl_*"))  # no temp dir / oversized output left
 
 
-# yt-dlp Test F — oversized output cleanup (also asserted in C/D/E).
+# yt-dlp Test F — oversized output removed (also asserted in C/D/E).
 def test_ytdl_oversized_output_removed(tmp_path):
-    fake = _ytdl_fake(tmp_path, {"vid123.webm": b"x" * 500}, template="vid123.mp4")
+    fake = _ytdl_fake({"vid123.webm": b"x" * 500}, template="vid123.mp4")
     with pytest.raises(MediaError):
         _ytdl_run(fake, 100, tmp_path)
     assert not (tmp_path / "vid123.webm").exists()
 
 
 def test_ytdl_no_output_raises(tmp_path):
-    fake = _ytdl_fake(tmp_path, {})
+    fake = _ytdl_fake({})
     with pytest.raises(MediaError):
         _ytdl_run(fake, 100, tmp_path)
+
+
+# ---- Defect B: current-output identity (stale same-ID file must never win) ----
+
+# Test A — a stale LARGER same-ID file is not selected over the current output.
+def test_ytdl_stale_larger_same_id_not_selected(tmp_path):
+    (tmp_path / "vid123.webm").write_bytes(b"x" * 90)  # old stale file, larger
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 80}, requested_filepaths=["vid123.mkv"])
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mkv")  # current output, NOT the stale webm
+    assert (tmp_path / "vid123.webm").exists()  # stale file untouched
+
+
+# Test B — a stale SMALLER same-ID file does not matter either.
+def test_ytdl_stale_smaller_same_id_not_selected(tmp_path):
+    (tmp_path / "vid123.webm").write_bytes(b"x" * 20)
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 80}, requested_filepaths=["vid123.mkv"])
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mkv")
+    assert (tmp_path / "vid123.webm").exists()
+
+
+# Test C — authoritative requested_downloads filepath wins over directory guesses.
+def test_ytdl_authoritative_filepath_metadata_wins(tmp_path):
+    # Two current-looking files, but yt-dlp's metadata names exactly one as final.
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 80, "vid123.part.mp4": b"x" * 30},
+                      requested_filepaths=["vid123.mkv"])
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mkv")
+
+
+# Test D — postprocessed extension differs from the prepare_filename template.
+def test_ytdl_postprocessed_extension_difference(tmp_path):
+    # template says .webm, but the real postprocessed (converted) file is .mp4.
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 80}, template="vid123.webm")
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mp4")
+    assert (tmp_path / "vid123.mp4").stat().st_size == 80
+
+
+# Test E — current oversized output removed; the stale same-ID file is retained.
+def test_ytdl_oversized_current_removed_stale_retained(tmp_path):
+    (tmp_path / "vid123.webm").write_bytes(b"x" * 50)  # stale file, under limit
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 101}, requested_filepaths=["vid123.mkv"])
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
+    assert not (tmp_path / "vid123.mkv").exists()  # current output cleanup
+    assert (tmp_path / "vid123.webm").exists()     # stale file NOT deleted
+    assert (tmp_path / "vid123.webm").stat().st_size == 50
+
+
+# Test I — unrelated destination files are untouched by the yt-dlp operation.
+def test_ytdl_unrelated_files_untouched(tmp_path):
+    (tmp_path / "other-video.mp4").write_bytes(b"x" * 12)
+    (tmp_path / "notes.txt").write_bytes(b"hashed pen")
+    (tmp_path / "some-image.jpg").write_bytes(b"j" * 7)
+    fake = _ytdl_fake({"vid123.mp4": b"x" * 80})
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mp4")
+    assert (tmp_path / "other-video.mp4").read_bytes() == b"x" * 12
+    assert (tmp_path / "notes.txt").read_bytes() == b"hashed pen"
+    assert (tmp_path / "some-image.jpg").read_bytes() == b"j" * 7
+
+
+# Test J — ambiguous current output (no authoritative metadata) fails safely.
+def test_ytdl_ambiguous_output_fails_safely(tmp_path):
+    fake = _ytdl_fake({"vid123.mkv": b"x" * 80, "vid123.webm": b"x" * 90})
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
+    # neither may be moved into the destination by a guessed pick
+    assert not (tmp_path / "vid123.mkv").exists()
+    assert not (tmp_path / "vid123.webm").exists()
 
 
 # ------------------------------------------------- main.prepare_item
