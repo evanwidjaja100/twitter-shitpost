@@ -53,13 +53,13 @@ def _powershell():
     return None
 
 
-def _run_ps(args, timeout=180):
+def _run_ps(args, timeout=180, cwd=None):
     ps = _powershell()
     if ps is None:
         pytest.skip("no PowerShell available")
     return subprocess.run(
         [ps, "-NoProfile", "-ExecutionPolicy", "Bypass"] + args,
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, timeout=timeout, cwd=cwd,
     )
 
 
@@ -115,6 +115,40 @@ def _spaced_dir() -> Path:
     return d
 
 
+def _make_portable_repo(tmp: Path):
+    """Clone the deployment scripts into a temp dir whose path contains spaces:
+    ``run_bot.ps1`` / ``setup_task.ps1`` copied verbatim, a working venv-shaped
+    Python (real python.exe + matching ``pyvenv.cfg``), and a harmless stub
+    ``main.py`` that records its own location, the CWD it ran under and its
+    argv, then exits 7. Returns the temp repo root. Nothing here touches X,
+    a real daemon, or the real Task Scheduler."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(RUN_BOT, tmp / "run_bot.ps1")
+    shutil.copy2(SETUP_TASK, tmp / "setup_task.ps1")
+    (tmp / ".venv" / "Scripts").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / ".venv" / "Scripts" / "python.exe",
+                 tmp / ".venv" / "Scripts" / "python.exe")
+    (tmp / ".venv" / "pyvenv.cfg").write_text(
+        "home = {home}\ninclude-system-site-packages = false\n"
+        "version = {v}\n".format(
+            home=Path(sys.base_prefix),
+            v=".".join(map(str, sys.version_info[:3])),
+        ),
+        encoding="utf-8",
+    )
+    (tmp / "main.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "here = Path(__file__).resolve().parent\n"
+        "(here / 'ran.txt').write_text('RAN')\n"
+        "(here / 'cwd.txt').write_text(str(Path.cwd()))\n"
+        "(here / 'argv.txt').write_text(repr(sys.argv[1:]))\n"
+        "sys.exit(7)\n",
+        encoding="utf-8",
+    )
+    return tmp
+
+
 @staticmethod
 def _windows():
     return sys.platform == "win32"
@@ -158,11 +192,31 @@ def test_argv_contains_expected_parts():
 
 @pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
 def test_paths_with_spaces_quoted():
-    snap, err = _action_snapshot()
-    assert snap is not None, f"snapshot failed:\n{err}"
-    args = snap["ARGUMENTS"]
-    assert "\\test\\twitter shitpost\\main.py" in args
+    """Construct the action top-down with an explicitly spaced base and prove
+    every derived path (pythonw, main.py, both logs) ends up double-quoted."""
+    base = _spaced_dir() / "with spaces"
+    base.mkdir(parents=True, exist_ok=True)
+    script = _escape(str(SETUP_TASK))
+    code = f"""
+. '{script}' -SkipRegister
+$a = New-BotScheduledTaskAction -BasePath '{_escape(str(base))}'
+"ARGS=" + $a.Arguments
+"WD=" + $a.WorkingDirectory
+"""
+    res = _run_ps(["-Command", code])
+    assert res.returncode == 0, res.stdout + res.stderr
+    snap = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            snap[k.strip()] = v.strip()
+    args = snap["ARGS"]
+    assert f'"{base}\\main.py"' in args, args
+    assert f'"{base}\\.venv\\Scripts\\pythonw.exe"' in args, args
+    assert f'"{base}\\logs\\daemon_out.log"' in args, args
+    assert f'"{base}\\logs\\daemon_err.log"' in args, args
     assert args.count('"') >= 4  # python + script + stdout + stderr paths
+    assert snap["WD"].lower() == str(base).lower()
 
 
 # --------------------------------------------------------------------------
@@ -244,7 +298,7 @@ def test_b7_restart_settings_intact():
 def test_working_directory_correct():
     snap, err = _action_snapshot()
     assert snap is not None, f"snapshot failed:\n{err}"
-    assert "twitter shitpost" in snap["WORKINGDIR"]
+    assert snap["WORKINGDIR"].lower().rstrip("\\") == str(ROOT).lower()
 
 
 # --------------------------------------------------------------------------
@@ -284,3 +338,105 @@ def test_no_registration_happens():
     res = _run_ps(["-Command", code])
     assert res.returncode == 0, res.stdout + res.stderr
     assert "GUARD-OK" in res.stdout
+
+
+# ---------------------------------------------------------------------------
+# Portability: no machine-specific repo path; base derived from $PSScriptRoot
+# ---------------------------------------------------------------------------
+
+MACHINE_PATH = r"D:\Desktop\test\twitter shitpost"
+
+
+@pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
+def test_deployment_scripts_contain_no_machine_specific_path():
+    """PowerShell Test A — the old hardcoded installation path must be absent
+    from every production .ps1 (not merely renamed elsewhere)."""
+    for script in (RUN_BOT, SETUP_TASK):
+        text = script.read_text(encoding="utf-8")
+        assert MACHINE_PATH not in text, f"{script.name} still hardcodes {MACHINE_PATH}"
+        assert "Desktop" not in text, f"{script.name} references a Desktop path"
+
+
+@pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
+def test_deployment_scripts_derive_base_from_psscriptroot():
+    """Repository base must come from the script's own location, never from
+    the shell's current working directory."""
+    for script in (RUN_BOT, SETUP_TASK):
+        text = script.read_text(encoding="utf-8")
+        assert "$PSScriptRoot" in text, f"{script.name} does not use $PSScriptRoot"
+        assert "Get-Location" not in text and "(Get-Location" not in text, \
+            f"{script.name} must not resolve base from CWD"
+    assert ".venv\\Scripts\\python.exe" in RUN_BOT.read_text(encoding="utf-8")
+    assert "main.py" in RUN_BOT.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
+def test_setup_task_derives_repo_from_script_location(tmp_path):
+    """PowerShell Test C — copy setup_task.ps1 into a spaced temp dir, invoke
+    it from an UNRELATED CWD, and confirm WorkingDirectory / python / main.py /
+    logs all resolve to the script's directory, not the CWD."""
+    probe = _make_portable_repo(tmp_path / f"portable repo {uuid.uuid4().hex[:6]}")
+    foreign_cwd = _spaced_dir()  # definitely not `probe`
+    script = _escape(str(probe / "setup_task.ps1"))
+    code = f"""
+. '{script}' -SkipRegister
+$a = New-BotScheduledTaskAction
+"EXEC=" + $a.Execute
+"ARGS=" + $a.Arguments
+"WD=" + $a.WorkingDirectory
+"BASE=" + $base
+"""
+    res = _run_ps(["-Command", code], cwd=str(foreign_cwd))
+    assert res.returncode == 0, res.stdout + res.stderr
+    snap = {}
+    for line in res.stdout.splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            snap[k.strip()] = v.strip()
+    expected = str(probe)
+    assert snap["BASE"].lower() == expected.lower(), snap
+    assert snap["WD"].lower() == expected.lower(), snap
+    assert snap["EXEC"] == "cmd.exe"
+    assert snap["ARGS"].startswith("/d /s /c \"\""), snap["ARGS"]
+    assert f'{expected}\\.venv\\Scripts\\pythonw.exe' in snap["ARGS"], snap["ARGS"]
+    assert f'{expected}\\main.py' in snap["ARGS"], snap["ARGS"]
+    assert f'{expected}\\logs\\daemon_out.log' in snap["ARGS"], snap["ARGS"]
+    assert f'{expected}\\logs\\daemon_err.log' in snap["ARGS"], snap["ARGS"]
+    # PROVE the resolved paths are NOT the foreign CWD.
+    assert str(foreign_cwd).lower() not in snap["WD"].lower()
+
+
+@pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
+def test_run_bot_real_cwd_independence_and_exit_code(tmp_path):
+    """PowerShell Tests B/H/G combined — the REAL run_bot.ps1 (copied verbatim
+    into a spaced temp repo) is invoked from an unrelated CWD. It must resolve
+    main.py + the .venv interpreter from its OWN directory, run the stub, and
+    propagate the stub's exit code 7. No real daemon, no X, no scheduler."""
+    probe = _make_portable_repo(tmp_path / f"portable repo {uuid.uuid4().hex[:6]}")
+    foreign_cwd = _spaced_dir()  # definitely not `probe`
+    res = _run_ps(["-File", str(probe / "run_bot.ps1")], cwd=str(foreign_cwd))
+    # G: exit code propagated from child to run_bot.ps1 to our caller.
+    assert res.returncode == 7, res.stdout + res.stderr
+    # B: main.py resolved from the script's directory (ran.txt lives there).
+    assert (probe / "ran.txt").exists(), "run_bot did not run the repo-local main.py"
+    assert (probe / "ran.txt").read_text(encoding="utf-8") == "RAN"
+    # H: the child process ran under the foreign CWD, NOT the script's dir —
+    # proving repo-relative files came from $PSScriptRoot, not Get-Location.
+    ran_cwd = (probe / "cwd.txt").read_text(encoding="utf-8")
+    assert Path(ran_cwd).resolve() != probe
+    # the stub received the daemon argument.
+    assert (probe / "argv.txt").read_text(encoding="utf-8") == "['daemon']"
+
+
+@pytest.mark.skipif(not _windows(), reason="Windows-specific deployment scripts")
+def test_run_bot_fails_early_on_missing_python(tmp_path):
+    """Optional hardening: missing .venv interpreter fails fast with a clear
+    message instead of a confusing 'not recognized' native error."""
+    probe = tmp_path / "missing venv"
+    probe.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(RUN_BOT, probe / "run_bot.ps1")
+    (probe / "main.py").write_text("print('x')\n", encoding="utf-8")
+    foreign_cwd = _spaced_dir()
+    res = _run_ps(["-File", str(probe / "run_bot.ps1")], cwd=str(foreign_cwd))
+    assert res.returncode == 1
+    assert "not found" in (res.stdout + res.stderr).lower()

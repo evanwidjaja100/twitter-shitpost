@@ -118,6 +118,30 @@ class TestPrePostQuotaRecheck:
         pick.assert_not_called()
         session.post.assert_not_called()
 
+    def test_lowered_max_reached_while_sleeping(self, tmp_path):
+        """Old persisted target 6 + config max lowered to 4 + 4 window successes
+        -> the fresh recheck clamps to 4 and vetoes. Stale slot must not post."""
+        db = _db(tmp_path)
+        cfg = _cfg(tmp_path)
+        now = datetime(2026, 1, 6, 17, 0)
+        slots = scheduler.remaining_slots(
+            db, 3, 6, 16, 1, max_absolute=10, now=now, rng=random.Random(1)
+        )
+        assert slots  # a valid future slot existed under the old config
+        assert db.get_window_target("2026-01-06") is not None
+        db.set_window_target("2026-01-06", 6)  # guarantee target above new max
+
+        cfg["posting"]["max_posts_per_day"] = 4  # config lowered mid-window
+        for i in range(4):  # while 'sleeping': 4 successful window posts
+            _post_at(db, datetime(2026, 1, 6, 17, 10 + i))
+
+        result, session, pick = self._attempt(db, cfg, now)
+        assert result["outcome"] == "vetoed"
+        assert result["reason"] == "target_reached"
+        assert result["state"]["effective_target"] == 4
+        pick.assert_not_called()
+        session.post.assert_not_called()
+
     def test_window_expired_while_sleeping(self, tmp_path):
         """I: wake time is outside the active logical window."""
         db = _db(tmp_path)

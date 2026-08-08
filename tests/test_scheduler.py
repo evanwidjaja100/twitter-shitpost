@@ -295,3 +295,160 @@ class TestCalendarDayAbsoluteCap:
         start = datetime(2026, 1, 5, 16, 0).timestamp()
         end = datetime(2026, 1, 6, 1, 0).timestamp()
         assert db.window_post_count(start, end) == 2
+
+
+WINDOW_START = datetime(2026, 1, 6, 16, 0)
+WINDOW_END = datetime(2026, 1, 7, 1, 0)
+
+
+class TestPersistedTargetClamp:
+    """Regression: a persisted target from an old (higher) config must never
+    authorize posting above the CURRENT configured max_posts_per_day.
+
+    The stored target stays unchanged (restart consistency); only the
+    authorization math clamps it. The calendar-day absolute cap stays an
+    independent backstop.
+    """
+
+    def _now(self):
+        return datetime(2026, 1, 6, 17, 0)
+
+    def _check(self, db, max_posts=6, max_absolute=10):
+        return scheduler.check_posting_limits(
+            db, 3, max_posts, 16, 1,
+            max_absolute=max_absolute, now=self._now(), rng=random.Random(1),
+        )
+
+    def test_a_old_target_above_lowered_max_blocks(self, tmp_path):
+        """target=6, current max=4, posts=4 -> remaining=0, allowed=False."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        for i in range(4):
+            _post_at(db, datetime(2026, 1, 6, 16, 10 + i))
+
+        state = self._check(db, max_posts=4)
+        assert not state["allowed"]
+        assert state["remaining"] == 0
+        assert state["window_room"] == 0
+        assert state["effective_target"] == 4
+        assert state["target"] == 6  # stored original preserved
+        assert db.get_window_target("2026-01-06") == 6
+        assert _slots(db, 16, 1, self._now(), max_posts=4, max_absolute=10, seed=1) == []
+
+    def test_b_one_slot_remaining_under_lowered_max(self, tmp_path):
+        """target=6, current max=4, posts=3 -> remaining=1, NOT 3."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        for i in range(3):
+            _post_at(db, datetime(2026, 1, 6, 16, 10 + i))
+
+        state = self._check(db, max_posts=4)
+        assert state["window_room"] == 1
+        assert state["remaining"] == 1
+        assert state["effective_target"] == 4
+        assert len(_slots(db, 16, 1, self._now(), max_posts=4, max_absolute=10, seed=1)) == 1
+        assert db.get_window_target("2026-01-06") == 6  # untouched
+
+    def test_c_already_above_lowered_max(self, tmp_path):
+        """target=6, current max=4, posts=5 -> remaining=0. Historical posts
+        stay intact; no negative quota is minted."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        for i in range(5):
+            _post_at(db, datetime(2026, 1, 6, 16, 10 + i))
+
+        state = self._check(db, max_posts=4)
+        assert state["remaining"] == 0
+        assert not state["allowed"]
+        assert state["window_room"] == 0
+        # no negative usable quota
+        assert _slots(db, 16, 1, self._now(), max_posts=4, max_absolute=10, seed=1) == []
+        # historical successful posts are NOT deleted/rewritten
+        assert db.window_post_count(WINDOW_START.timestamp(), WINDOW_END.timestamp()) == 5
+
+    def test_d_target_below_max_unchanged(self, tmp_path):
+        """target=3, current max=5, posts=1 -> logical room 2, NOT 4."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 3)
+        _post_at(db, datetime(2026, 1, 6, 16, 10))
+
+        state = self._check(db, max_posts=5)
+        assert state["effective_target"] == 3
+        assert state["window_room"] == 2
+        assert state["remaining"] == 2
+
+    def test_e_new_target_within_config_range(self, tmp_path):
+        """No persisted target: minted target stays inside 3..5 inclusive."""
+        for seed in range(8):
+            db = _db(tmp_path)  # fresh db per seed (target minted once)
+            now = datetime(2026, 1, 6, 17, 0)
+            state = scheduler.check_posting_limits(
+                db, 3, 5, 16, 1, max_absolute=10, now=now, rng=random.Random(seed)
+            )
+            t = db.get_window_target("2026-01-06")
+            assert 3 <= t <= 5, f"seed {seed}"
+            assert state["target"] == t
+            assert state["effective_target"] == t  # below max: clamp is identity
+
+    def test_f_absolute_cap_stricter_than_window_after_clamp(self, tmp_path):
+        """min(window_room, absolute_room) preserved: abs cap 4, 4 posts today."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)  # clamped to current max 5 -> effective 5
+        _post_at(db, datetime(2026, 1, 6, 16, 5))
+        _post_at(db, datetime(2026, 1, 6, 16, 10))
+        for i in range(4):
+            _post_at(db, datetime(2026, 1, 6, 0, i * 2))
+
+        state = self._check(db, max_posts=5, max_absolute=4)
+        assert state["window_posts"] == 2
+        assert state["window_room"] == 3  # min(6,5) - 2
+        assert state["today_posts"] == 6  # 4 morning posts + 2 window posts (same day)
+        assert state["absolute_room"] == 0
+        assert state["remaining"] == 0
+        assert not state["allowed"]
+        assert state["reason"] == "daily_absolute_cap"
+
+    def test_g_logical_target_stricter_than_absolute(self, tmp_path):
+        """effective target reached while absolute cap still has room."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 3)
+        for i in range(3):
+            _post_at(db, datetime(2026, 1, 6, 16, 10 + i))
+
+        state = self._check(db, max_posts=5, max_absolute=10)
+        assert state["window_room"] == 0
+        assert state["absolute_room"] == 7
+        assert state["remaining"] == 0
+        assert not state["allowed"]
+        assert state["reason"] == "target_reached"
+
+    def test_min_above_max_never_crashes(self, tmp_path):
+        """Malformed min>max must not blow up rng.randint(); the minted target
+        can never exceed the current maximum."""
+        db = _db(tmp_path)
+        now = datetime(2026, 1, 6, 17, 0)
+        for seed in range(5):
+            state = scheduler.check_posting_limits(
+                db, 10, 4, 16, 1, max_absolute=10, now=now, rng=random.Random(seed)
+            )
+            t = db.get_window_target("2026-01-06")
+            assert t is not None
+            assert 0 < t <= 4
+            assert state["effective_target"] == t
+            assert state["remaining"] >= 0
+
+    def test_restore_max_reenables_original_target(self, tmp_path):
+        """Stored target preserved: after a lowered-max window the original
+        higher target may legitimately become effective again."""
+        db = _db(tmp_path)
+        _set_target(db, "2026-01-06", 6)
+        now = datetime(2026, 1, 6, 17, 0)
+
+        lowered = self._check(db, max_posts=4)
+        assert lowered["effective_target"] == 4
+        assert db.get_window_target("2026-01-06") == 6
+
+        restored = self._check(db, max_posts=6)
+        assert restored["effective_target"] == 6
+        assert restored["target"] == 6
+        assert restored["window_room"] == 6

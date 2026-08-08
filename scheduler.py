@@ -12,6 +12,12 @@ loop iterations and survives daemon restarts. Only the *remaining* slots
 the configured maximum is a real maximum and repeating the scheduling loop can
 never mint another full quota.
 
+A persisted target is an *authorization ceiling* as well as a randomness seed:
+the stored target is kept unchanged for restart consistency, but the *effective*
+target used for remaining-slot math is ``min(stored_target, current max)``. If
+the user lowers ``max_posts_per_day`` mid-window, an old higher stored target
+can therefore never authorize posts above the newly configured maximum.
+
 Two independent counters are enforced:
 
 * logical posting-window quota: the persisted target minus successful posts
@@ -118,9 +124,10 @@ def check_posting_limits(
     Returns an info dict separating the logical posting-window count from the
     local calendar-day absolute count (they are NEVER merged into one counter):
 
-        window_room = target - window_posts          # 3-6/day logical window
-        absolute_room = max_absolute - today_posts    # per-calendar-day backstop
-        remaining   = max(0, min(window_room, absolute_room))
+        effective_target = min(persisted_target, current max)  # clamp
+        window_room     = effective_target - window_posts       # 3-6/day logical window
+        absolute_room   = max_absolute - today_posts            # per-calendar-day backstop
+        remaining       = max(0, min(window_room, absolute_room))
 
     `window_posts` counts successful posts inside the current logical window.
     `today_posts` counts successful posts on the machine-local calendar day of
@@ -141,12 +148,24 @@ def check_posting_limits(
 
     target = db.get_window_target(wid) if active else None
     if active and target is None:
-        target = int(rng.randint(int(min_posts), int(max_posts)))
+        # Never let a malformed config (min > max) blow up rng.randint() at
+        # runtime; a minted target can never exceed the current maximum.
+        lo = int(min_posts)
+        hi = int(max_posts)
+        if lo > hi:
+            lo = hi
+        target = int(rng.randint(lo, hi))
         db.set_window_target(wid, target)
+
+    # A persisted target must never authorize posting above the current
+    # configured maximum. Clamp for authorization only; the stored original is
+    # left untouched so restart consistency and a later re-raise of the max
+    # (which may legitimately re-enable the original target) are preserved.
+    effective_target = min(target, int(max_posts)) if target is not None else None
 
     window_posts = (db.window_post_count(start.timestamp(), end.timestamp())
                     if active else 0)
-    window_room = max(target - window_posts, 0) if active and target is not None else 0
+    window_room = max(effective_target - window_posts, 0) if active and effective_target is not None else 0
 
     today_posts = db.posts_today(now.timestamp())
     absolute_room = (max(int(max_absolute) - today_posts, 0)
@@ -176,6 +195,7 @@ def check_posting_limits(
         "window_end": end,
         "window_posts": window_posts,
         "target": target,
+        "effective_target": effective_target,
         "window_room": window_room,
         "today_posts": today_posts,
         "absolute_room": absolute_room,

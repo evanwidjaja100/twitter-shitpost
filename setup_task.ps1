@@ -4,7 +4,10 @@
 param([switch]$SkipRegister)
 
 $ErrorActionPreference = "Stop"
-$base = "D:\Desktop\test\twitter shitpost"
+# Repository root = directory containing THIS script, so the task is correct no
+# matter where the repository was cloned or which directory setup_task.ps1 is
+# executed from.
+$base = $PSScriptRoot
 
 # cmd.exe wrapper preserves the Python daemon's exit code after redirecting
 # output, so Task Scheduler only sees a "failed task" when the daemon really
