@@ -10,6 +10,11 @@ yt-dlp. All selectors live here so they're a single point of maintenance.
 Metadata correctness: every feed video's like count, description and URL are
 read from the SAME card/container element, never from page-global ``.first``
 selectors, so candidates in one feed cannot exchange metadata.
+
+Duplicate videos: observations of the same video id (feed vs accounts, or a
+repeated card) are merged via ``_merge_tiktok_candidate`` — the best valid like
+count and the most complete caption win, regardless of discovery order, and
+each video is emitted exactly once.
 """
 
 import logging
@@ -58,6 +63,39 @@ def _card(href: str, likes: int, caption: str) -> dict:
     }
 
 
+def _better_caption(existing: str, incoming: str) -> str:
+    """Deterministic caption choice: non-empty beats empty, longer beats shorter,
+    ties keep the earlier value. Never invents or concatenates text."""
+    if not existing:
+        return incoming
+    if not incoming:
+        return existing
+    if len(incoming) != len(existing):
+        return incoming if len(incoming) > len(existing) else existing
+    return existing
+
+
+def _merge_tiktok_candidate(existing: dict | None, incoming: dict) -> dict:
+    """Merge two observations of the SAME TikTok video into one candidate.
+
+    Independent of discovery order:
+      * likes   — max of valid values (engagement grows over time); a missing/
+                  unparseable value (0) can never overwrite a valid one.
+      * caption — ``_better_caption``: non-empty beats empty, longer beats
+        shorter, ties keep the earlier value.
+      * id/href — the first (canonical/stable) record is preserved so identity
+        never churns between observations.
+    """
+    if existing is None:
+        return incoming
+    return {
+        "id": existing["id"],
+        "href": existing["href"],
+        "likes": max(int(existing.get("likes", 0) or 0), int(incoming.get("likes", 0) or 0)),
+        "caption": _better_caption(existing.get("caption", "") or "", incoming.get("caption", "") or ""),
+    }
+
+
 def _extract_feed_card(card) -> dict | None:
     """Extract one logical feed/source entry STRICTLY from its own card element.
 
@@ -92,41 +130,43 @@ def _collect_cards(page, limit: int) -> list[dict]:
     """Return [{'id','href','likes','caption'}...] for visible video cards.
 
     Every card is scoped: its link, like count and description are read from
-    the SAME container, so metadata cannot attach to the wrong video.
+    the SAME container, so metadata cannot attach to the wrong video. When the
+    same video id is observed more than once, observations are merged (better
+    likes/caption win) instead of discarding the later record.
     """
-    cards: list[dict] = []
-    seen: set[str] = set()
+    merged: dict[str, dict] = {}
     for el in page.locator(_CARD).all():
-        item = _extract_feed_card(el)
-        if item is None or item["id"] in seen:
+        card = _extract_feed_card(el)
+        if card is None:
             continue
-        seen.add(item["id"])
-        cards.append(item)
-        if len(cards) >= limit:
+        merged[card["id"]] = _merge_tiktok_candidate(merged.get(card["id"]), card)
+        if len(merged) >= limit:
             break
-    return cards
+    return list(merged.values())
 
 
 def _collect_feed(page, max_posts: int, scrolls: int) -> list[dict]:
-    """Scroll the For You feed, collecting per-card metadata for each video."""
-    cards: list[dict] = []
-    seen: set[str] = set()
+    """Scroll the For You feed, collecting per-card metadata for each video.
+
+    Duplicate observations of the same video are merged (best likes/caption are
+    kept) rather than dropping whichever record appeared second.
+    """
+    merged: dict[str, dict] = {}
     probes = max(scrolls * _FEED_SCROLL_MULTIPLIER, 8)
     for _ in range(probes):
         for el in page.locator(_CARD).all():
-            item = _extract_feed_card(el)
-            if item is None or item["id"] in seen:
+            card = _extract_feed_card(el)
+            if card is None:
                 continue
-            seen.add(item["id"])
-            cards.append(item)
-            if len(cards) >= max_posts:
-                return cards
+            merged[card["id"]] = _merge_tiktok_candidate(merged.get(card["id"]), card)
+            if len(merged) >= max_posts:
+                return list(merged.values())
         try:
             page.mouse.wheel(0, 3000)
         except Exception:
             pass
         page.wait_for_timeout(random.randint(1800, 2800))
-    return cards
+    return list(merged.values())
 
 
 def _to_item(card: dict, handle: str, min_likes: int) -> dict | None:
@@ -162,7 +202,8 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     scrolls = int(config.get("scrolls", 3))
 
     items: list[dict] = []
-    seen_ids: set[str] = set()
+    collected: dict[str, dict] = {}
+    handle_for: dict[str, str] = {}
     context = session._context
     page = context.new_page()
     try:
@@ -174,16 +215,9 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                 log.warning("tiktok feed load failed: %s", e)
                 return items
             for card in _collect_feed(page, max_posts, scrolls):
-                if card["id"] in seen_ids:
-                    continue
-                item = _to_item(card, "", min_likes)
-                if item is None:
-                    continue
-                seen_ids.add(card["id"])
-                items.append(item)
-
-        if not accounts:
-            return items
+                collected[card["id"]] = _merge_tiktok_candidate(
+                    collected.get(card["id"]), card
+                )
 
         for handle in accounts:
             handle = (handle or "").strip().lstrip("@")
@@ -203,21 +237,22 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                 log.warning("profile %s failed: %s", handle, e)
                 continue
 
-            collected = 0
             for card in _collect_cards(page, max_posts):
-                if card["id"] in seen_ids:
-                    continue
-                item = _to_item(card, handle, min_likes)
-                if item is None:
-                    continue
-                seen_ids.add(card["id"])
-                items.append(item)
-                collected += 1
-                if collected >= max_posts:
-                    break
+                prev = collected.get(card["id"])
+                merged = _merge_tiktok_candidate(prev, card)
+                collected[card["id"]] = merged
+                if prev is None or (
+                    card["caption"] and merged["caption"] == card["caption"]
+                ):
+                    handle_for[card["id"]] = handle
     finally:
         try:
             page.close()
         except Exception:
             pass
+
+    for card in collected.values():
+        item = _to_item(card, handle_for.get(card["id"], ""), min_likes)
+        if item is not None:
+            items.append(item)
     return items

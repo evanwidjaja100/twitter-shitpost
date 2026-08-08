@@ -8,6 +8,7 @@ import logging
 import random
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger("x_scraper")
 
@@ -127,15 +128,53 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     return items
 
 
-def download_media(session, item: dict, dest_dir: str, max_bytes: int | None = None) -> str | None:
-    """Download item media using the session's cookies.
+def _host_matches(host: str, domain: str) -> bool:
+    """True when ``domain`` is the host itself or a parent domain (safe to send)."""
+    if not host or not domain:
+        return False
+    host = host.lower()
+    domain = domain.lower().lstrip(".")
+    return host == domain or host.endswith("." + domain)
 
-    ``max_bytes`` is an authoritative ceiling: an oversized Content-Length is
-    rejected before ``resp.body()`` is ever read, and the body itself is
-    validated against the limit before anything is written to disk. A media
-    response that cannot be proven within the limit is never returned.
+
+def _copy_cookies(session, url: str) -> dict:
+    """Copy only the cookies relevant to the media host from the browser context.
+
+    Cookies are read in-process and never logged, printed or persisted. Only
+    cookies whose domain matches (or is a parent of) the media host are copied.
+    X media hosts (pbs.twimg.com) are typically public, so this is usually an
+    empty map. If the context has no usable cookie API, an empty map is used.
+    """
+    ctx = getattr(session, "_context", None)
+    if ctx is None or not hasattr(ctx, "cookies"):
+        return {}
+    try:
+        raw = ctx.cookies()
+    except Exception:
+        return {}
+    host = urlparse(url).hostname if url else ""
+    return {
+        c["name"]: c["value"]
+        for c in raw or []
+        if c.get("name") is not None
+        and c.get("value") is not None
+        and _host_matches(host or "", c.get("domain", ""))
+    }
+
+
+def download_media(session, item: dict, dest_dir: str, max_bytes: int | None = None) -> str | None:
+    """Download item media via the bounded streaming downloader.
+
+    The transfer is NEVER materialized in memory before the limit is enforced:
+    this is a true HTTP stream with a Content-Length early check PLUS a running
+    byte counter that hard-aborts the moment ``max_bytes`` is exceeded, exactly
+    like ``pipeline.media.download``. A partial/oversized file is removed. The
+    browser context's cookies (restricted to the media host) are transferred so
+    authenticated media still works without buffering the body.
     Returns local path or None.
     """
+    from pipeline import media as m
+
     url = item.get("media_url")
     if not url:
         return None
@@ -148,34 +187,14 @@ def download_media(session, item: dict, dest_dir: str, max_bytes: int | None = N
         ext = ".gif"
     out = dest / f"{item['source_id']}{ext}"
     try:
-        resp = session._context.request.get(url, headers={"Referer": "https://x.com/"})
-        if not resp.ok:
-            log.warning("media download %s -> %s", url, resp.status)
-            return None
-
-        if max_bytes is not None:
-            cl = resp.headers.get("content-length") or resp.headers.get("Content-Length")
-            if cl is not None:
-                try:
-                    if int(cl) > max_bytes:
-                        log.warning(
-                            "media download rejected: %s Content-Length %s exceeds %d",
-                            url, cl, max_bytes,
-                        )
-                        return None
-                except ValueError:
-                    pass  # malformed header; real body length is checked below
-
-        body = resp.body()
-        if max_bytes is not None and len(body) > max_bytes:
-            log.warning(
-                "media download rejected: %s body %d bytes exceeds %d",
-                url, len(body), max_bytes,
-            )
-            return None
-
-        out.write_bytes(body)
+        m.download(
+            url,
+            str(out),
+            referer="https://x.com/",
+            max_bytes=max_bytes,
+            cookies=_copy_cookies(session, url) or None,
+        )
         return str(out)
-    except Exception as e:
-        log.warning("media download failed: %s", e)
+    except m.MediaError as e:
+        log.warning("media download rejected: %s", e)
         return None

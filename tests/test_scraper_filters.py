@@ -375,3 +375,99 @@ def test_x_item_exposed_fields():
     assert it["source_id"] == "123"
     assert it["source_url"] == "https://x.com/handle/status/123"
     assert it["score"] == 3000.0
+
+
+# ------------------------------------------------------ TikTok duplicate merge
+
+def _merge_dict(video_id, likes, caption):
+    return {
+        "id": video_id,
+        "href": f"https://www.tiktok.com/video/{video_id}",
+        "likes": likes,
+        "caption": caption,
+    }
+
+
+def _merge(existing, incoming):
+    return tiktok_scraper._merge_tiktok_candidate(existing, incoming)
+
+
+# Merge Test A — higher likes win regardless of discovery order.
+def test_merge_a_higher_likes_preserved_order_independent():
+    low = _merge_dict("111", 1000, "feed caption")
+    high = _merge_dict("111", 9000, "account caption")
+    assert _merge(low, high)["likes"] == 9000
+    assert _merge(high, low)["likes"] == 9000
+
+
+# Merge Test A (scrape level) — same-id duplicates in one feed merge to the best.
+def test_merge_a_scrape_same_video_duplicates_keep_highest_likes():
+    page = _feed_page([
+        _tt_node(video="111", like_count="1000", desc_text="first"),
+        _tt_node(video="111", like_count="9000", desc_text="second"),
+        _tt_node(video="222", like_count="1.2K", desc_text="other"),
+    ])
+    items = _tt_items(page, _tt_config(min_likes=0))
+    by_id = {i["source_id"]: i for i in items}
+    assert by_id["111"]["score"] == 9000.0
+    assert len(items) == 2
+
+
+# Merge Test B — non-empty caption beats empty, both discovery orders.
+def test_merge_b_caption_nonempty_beats_empty():
+    empty = _merge_dict("111", 1, "")
+    full = _merge_dict("111", 1, "actual caption")
+    assert _merge(empty, full)["caption"] == "actual caption"
+    assert _merge(full, empty)["caption"] == "actual caption"
+
+
+# Merge Test C — missing/unknown likes (0) never overwrite a valid value.
+def test_merge_c_missing_likes_do_not_overwrite():
+    valid = _merge_dict("111", 5000, "top")
+    missing = _merge_dict("111", 0, "top")
+    assert _merge(valid, missing)["likes"] == 5000
+    assert _merge(missing, valid)["likes"] == 5000
+
+
+def test_merge_c_scrape_unknown_likes_never_replaces_valid():
+    page = _feed_page([
+        _tt_node(video="111", like_count="5000", desc_text="top"),
+        _tt_node(video="111", like_count="abc", desc_text="dup"),
+    ])
+    items = _tt_items(page, _tt_config(min_likes=0))
+    by_id = {i["source_id"]: i for i in items}
+    assert by_id["111"]["score"] == 5000.0
+
+
+# Merge Test D — feed + account exposing the same video yield exactly one candidate.
+def test_merge_d_duplicate_emitted_once():
+    page = _feed_page([_tt_node(video="111", like_count="1000", desc_text="dup")])
+    items = _tt_items(page, _tt_config(foryou=True, accounts=["@handl"], min_likes=0))
+    ids = [i["source_id"] for i in items]
+    assert ids.count("111") == 1
+    assert len(items) == 1
+
+
+# Merge Test E — distinct videos must not be merged.
+def test_merge_e_distinct_videos_remain_distinct():
+    page = _feed_page([
+        _tt_node(video="111", like_count="100K", desc_text="a"),
+        _tt_node(video="222", like_count="1.2K", desc_text="b"),
+    ])
+    items = _tt_items(page, _tt_config(foryou=True, accounts=["@handl"], min_likes=0))
+    assert {i["source_id"] for i in items} == {"111", "222"}
+
+
+# Merge Test F — no metadata crossover when a duplicate observation is present.
+def test_merge_f_no_metadata_crossover():
+    page = _feed_page([
+        _tt_node(video="111", like_count="1000", desc_text="alpha"),
+        _tt_node(video="111", like_count="9000", desc_text="alpha2"),
+        _tt_node(video="222", like_count="1.2K", desc_text="beta"),
+    ])
+    items = _tt_items(page, _tt_config(min_likes=0))
+    by_id = {i["source_id"]: i for i in items}
+    assert by_id["111"]["score"] == 9000.0
+    assert by_id["111"]["title"] == "alpha2"          # video A's own caption only
+    assert by_id["222"]["score"] == 1200.0
+    assert by_id["222"]["title"] == "beta"            # video B's own caption only

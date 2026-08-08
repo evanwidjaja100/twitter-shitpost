@@ -124,23 +124,22 @@ def test_download_raises_on_http_error(tmp_path):
 
 # --------------------------------------------------------------- x download_media
 
-class _Resp:
-    def __init__(self, body=b"", ok=True, status=200, headers=None):
-        self._body = body
-        self.ok = ok
-        self.status = status
-        self.headers = headers or {}
+class _FakeXContext:
+    """Minimal fake of the Playwright BrowserContext: ONLY cookies().
 
-    def body(self):
-        return self._body
+    Deliberately has no ``request.get(...)`` — if production code still tried
+    the old Playwright API-request path it would fail with AttributeError.
+    """
+
+    def __init__(self, cookies=None):
+        self._cookies = cookies or []
+
+    def cookies(self, *a, **k):
+        return self._cookies
 
 
-def _x_session(resp):
-    return SimpleNamespace(
-        _context=SimpleNamespace(
-            request=SimpleNamespace(get=lambda url, headers=None: resp)
-        )
-    )
+def _x_session(cookies=None):
+    return SimpleNamespace(_context=_FakeXContext(cookies))
 
 
 def _x_item(url="https://pbs.twimg.com/media/photo.jpg", source_id="tweet123"):
@@ -152,31 +151,97 @@ def _x_item(url="https://pbs.twimg.com/media/photo.jpg", source_id="tweet123"):
     }
 
 
+def _x_download(resp, item=None, max_bytes=None, cookies=None, tmp_path=None, dest_dir=None):
+    dest = dest_dir or str(tmp_path)
+    with mock.patch("pipeline.media.requests.get", _stub_get(resp)):
+        return x_scraper.download_media(_x_session(cookies), item or _x_item(), dest, max_bytes=max_bytes)
+
+
+# Defect 2 Test A — oversized Content-Length rejected before transfer.
 def test_x_download_media_rejects_over_content_length(tmp_path):
-    resp = _Resp(body=b"a" * 50, headers={"content-length": "999999"})
-    got = x_scraper.download_media(_x_session(resp), _x_item(), str(tmp_path), max_bytes=100)
+    resp = _FakeResp(headers={"Content-Length": "999999"})
+    got = _x_download(resp, _x_item(), max_bytes=100, tmp_path=tmp_path)
     assert got is None
     assert list(tmp_path.iterdir()) == []
 
 
-def test_x_download_media_rejects_over_body_without_cl(tmp_path):
-    resp = _Resp(body=b"a" * 500)
-    got = x_scraper.download_media(_x_session(resp), _x_item(), str(tmp_path), max_bytes=100)
+# Defect 2 Test B — missing Content-Length cannot bypass; no body materialization.
+def test_x_download_media_missing_cl_stops_at_limit(tmp_path):
+    resp = _FakeResp(body=b"a" * 200)
+    got = _x_download(resp, _x_item(), max_bytes=100, tmp_path=tmp_path)
     assert got is None
     assert list(tmp_path.iterdir()) == []
 
 
-def test_x_download_media_respects_body_within_limit(tmp_path):
-    resp = _Resp(body=b"a" * 80)
-    got = x_scraper.download_media(_x_session(resp), _x_item(), str(tmp_path), max_bytes=100)
-    assert got == str(tmp_path / "tweet123.jpg")
-    assert (tmp_path / "tweet123.jpg").read_bytes() == b"a" * 80
+# Defect 2 Test C — lying low Content-Length cannot bypass the ceiling.
+def test_x_download_media_lying_low_content_length_rejected(tmp_path):
+    resp = _FakeResp(headers={"Content-Length": "50"}, body=b"a" * 200)
+    got = _x_download(resp, _x_item(), max_bytes=100, tmp_path=tmp_path)
+    assert got is None
+    assert list(tmp_path.iterdir()) == []
+
+
+# Defect 2 Test D — exact max boundary succeeds.
+def test_x_download_media_exact_limit_succeeds(tmp_path):
+    resp = _FakeResp(body=b"a" * 100)
+    got = _x_download(resp, _x_item(), max_bytes=100, tmp_path=tmp_path)
+    assert got is not None
+    assert (tmp_path / "tweet123.jpg").read_bytes() == b"a" * 100
+
+
+# Defect 2 Test E — max + 1 rejected.
+def test_x_download_media_max_plus_one_rejected(tmp_path):
+    resp = _FakeResp(body=b"a" * 101)
+    got = _x_download(resp, _x_item(), max_bytes=100, tmp_path=tmp_path)
+    assert got is None
+    assert list(tmp_path.iterdir()) == []
+
+
+# Defect 2 Test F — multi-chunk success preserves exact byte sequence.
+def test_x_download_media_multichunk_content_correct(tmp_path):
+    payload = bytes(range(256)) * 3  # several chunks across the 64-byte fake iterator
+    resp = _FakeResp(body=payload)
+    got = _x_download(resp, _x_item(), max_bytes=10_000, tmp_path=tmp_path)
+    assert got is not None
+    assert (tmp_path / "tweet123.jpg").read_bytes() == payload
+
+
+# Defect 2 Test G — cleanup on network exception mid-stream.
+def test_x_download_media_cleans_partial_on_error(tmp_path):
+    class _Burst(_FakeResp):
+        def iter_content(self, chunk_size):
+            yield b"a" * 64
+            raise requests.exceptions.ConnectionError("socket gone")
+
+    got = _x_download(_Burst(body=b"a" * 300), _x_item(), max_bytes=10_000, tmp_path=tmp_path)
+    assert got is None
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_x_download_media_rejects_http_error(tmp_path):
-    got = x_scraper.download_media(_x_session(_Resp(ok=False, status=404)), _x_item(), str(tmp_path))
+    got = _x_download(_FakeResp(ok=False), _x_item(), max_bytes=100, tmp_path=tmp_path)
     assert got is None
     assert list(tmp_path.iterdir()) == []
+
+
+# Cookie transfer: only cookies whose domain matches the media host are copied.
+def test_x_download_media_copies_only_matching_domain_cookies(tmp_path):
+    cookies = [
+        {"name": "tw_cookie", "value": "cdnc-1", "domain": ".twimg.com"},
+        {"name": "auth_token", "value": "sess", "domain": ".x.com"},
+    ]
+    seen = {}
+
+    def _spy_get(url, headers=None, stream=True, timeout=90, allow_redirects=True, cookies=None):
+        seen["cookies"] = cookies
+        return _FakeResp(body=b"a" * 80)
+
+    with mock.patch("pipeline.media.requests.get", _spy_get):
+        got = x_scraper.download_media(
+            _x_session(cookies), _x_item(), str(tmp_path), max_bytes=100
+        )
+    assert got is not None
+    assert seen["cookies"] == {"tw_cookie": "cdnc-1"}  # session cookie NOT sent
 
 
 # ------------------------------------------------------------------ images
@@ -307,14 +372,17 @@ def test_validate_final_media_size(tmp_path):
         media.validate_final_media_size(str(tmp_path / "missing.jpg"), "image", 1000, 100)
 
 
-def test_ytdl_passes_max_filesize_option(tmp_path):
-    target = tmp_path / "vid123.mp4"
-    target.write_bytes(b"\x00" * 10)
-    captured = {}
+# ------------------------------------------------------------- yt-dlp size check
 
+def _ytdl_fake(dest_dir, files, info_id="vid123", template="vid123.mp4", captured=None):
+    """Build a fake YoutubeDL that writes ``files`` (name -> bytes) on download.
+
+    ``template`` is what ``prepare_filename`` returns (may differ from the real
+    written file, simulating yt-dlp renaming/merging). """
     class _FakeYDL:
         def __init__(self, opts):
-            captured["opts"] = opts
+            if captured is not None:
+                captured["opts"] = opts
 
         def __enter__(self):
             return self
@@ -323,15 +391,90 @@ def test_ytdl_passes_max_filesize_option(tmp_path):
             return False
 
         def extract_info(self, url, download=True):
-            return {"id": "vid123", "title": "t"}
+            for name, content in files.items():
+                (Path(dest_dir) / name).write_bytes(content)
+            return {"id": info_id, "title": "t"}
 
         def prepare_filename(self, info):
-            return str(target)
+            return str(Path(dest_dir) / template)
 
-    with mock.patch("pipeline.media.yt_dlp.YoutubeDL", lambda opts: _FakeYDL(opts)):
-        out = media.ytdl_download("https://youtu.be/vid123", str(tmp_path), 123456)
+    return _FakeYDL
+
+
+def _ytdl_run(fake, max_bytes, dest_dir):
+    with mock.patch("pipeline.media.yt_dlp.YoutubeDL", lambda opts: fake(opts)):
+        return media.ytdl_download("https://youtu.be/vid123", str(dest_dir), max_bytes)
+
+
+# yt-dlp Test (config): max_filesize remains configured.
+def test_ytdl_passes_max_filesize_option(tmp_path):
+    captured = {}
+    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 10}, captured=captured)
+    out = _ytdl_run(fake, 123456, tmp_path)
     assert captured["opts"]["max_filesize"] == 123456
-    assert out == str(target)
+    assert out == str(tmp_path / "vid123.mp4")
+
+
+# yt-dlp Test A — under limit accepted.
+def test_ytdl_under_limit_accepted(tmp_path):
+    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 80})
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mp4")
+    assert (tmp_path / "vid123.mp4").stat().st_size == 80
+
+
+# yt-dlp Test B — exact boundary accepted.
+def test_ytdl_exact_boundary_accepted(tmp_path):
+    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 100})
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mp4")
+
+
+# yt-dlp Test C — max + 1 rejected and removed.
+def test_ytdl_max_plus_one_rejected_and_removed(tmp_path):
+    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 101})
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
+    assert not (tmp_path / "vid123.mp4").exists()
+
+
+# yt-dlp Test D — downloader ignores max_filesize; the post-download stat catches it.
+def test_ytdl_ignored_max_filesize_still_caught(tmp_path):
+    captured = {}
+    # Fake receives max_filesize=100 but deliberately writes 101 bytes.
+    fake = _ytdl_fake(tmp_path, {"vid123.mp4": b"x" * 101}, captured=captured)
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
+    assert captured["opts"]["max_filesize"] == 100
+    assert not (tmp_path / "vid123.mp4").exists()
+
+
+# yt-dlp Test E — the actual final/postprocessed file is the one validated.
+def test_ytdl_actual_merged_filename_validated(tmp_path):
+    # prepare_filename points at a name that never materializes; the real merged
+    # file has a different name, and that file's size is what is checked.
+    fake = _ytdl_fake(tmp_path, {"vid123.mkv": b"x" * 80}, template="vid123.mp4")
+    out = _ytdl_run(fake, 100, tmp_path)
+    assert out == str(tmp_path / "vid123.mkv")  # actual file returned, not template
+
+    fake_big = _ytdl_fake(tmp_path, {"vid123.mkv": b"x" * 101}, template="vid123.mp4")
+    with pytest.raises(MediaError):
+        _ytdl_run(fake_big, 100, tmp_path)
+    assert not (tmp_path / "vid123.mkv").exists()
+
+
+# yt-dlp Test F — oversized output cleanup (also asserted in C/D/E).
+def test_ytdl_oversized_output_removed(tmp_path):
+    fake = _ytdl_fake(tmp_path, {"vid123.webm": b"x" * 500}, template="vid123.mp4")
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
+    assert not (tmp_path / "vid123.webm").exists()
+
+
+def test_ytdl_no_output_raises(tmp_path):
+    fake = _ytdl_fake(tmp_path, {})
+    with pytest.raises(MediaError):
+        _ytdl_run(fake, 100, tmp_path)
 
 
 # ------------------------------------------------- main.prepare_item

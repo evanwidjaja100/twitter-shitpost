@@ -43,7 +43,7 @@ def hash_file(path: str, chunk_size: int = 1 << 20) -> str:
 
 
 def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAULT_TIMEOUT,
-             max_bytes: int | None = None) -> str:
+             max_bytes: int | None = None, cookies: dict | None = None) -> str:
     """Stream-download a file with an authoritative byte ceiling.
 
     ``max_bytes`` is an absolute safety budget: the running streamed byte count
@@ -53,14 +53,16 @@ def download(url: str, dest_path: str, referer: str = None, timeout: int = DEFAU
 
     Content-Length is used only as an early-rejection optimisation (rejected
     immediately when present and over the ceiling); it is never trusted as the
-    sole enforcement.
+    sole enforcement. ``cookies`` (optional) is passed through to ``requests``
+    for authenticated streams; it is never logged.
     """
     dest = Path(dest_path)
     headers = {"User-Agent": USER_AGENT}
     if referer:
         headers["Referer"] = referer
     try:
-        with requests.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True) as r:
+        with requests.get(url, headers=headers, stream=True, timeout=timeout,
+                          allow_redirects=True, cookies=cookies) as r:
             r.raise_for_status()
             if max_bytes is not None:
                 cl = r.headers.get("Content-Length")
@@ -200,7 +202,14 @@ def video_duration(ffprobe: str, path: str) -> float:
 
 
 def ytdl_download(url: str, dest_dir: str, max_bytes: int, ffmpeg_dir: str = None) -> str:
-    """Download a video via yt-dlp. Returns path to downloaded file."""
+    """Download a video via yt-dlp. Returns path to downloaded file.
+
+    ``max_filesize`` is passed to yt-dlp as an early guard/optimisation ONLY.
+    The actual filesystem size of the real downloaded (possibly
+    postprocessed/merged) file is authoritative: if it exceeds ``max_bytes``
+    the oversized output is deleted and a :class:`MediaError` is raised, so
+    yt-dlp ignoring the advisory limit cannot produce an oversized source.
+    """
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     opts = {
@@ -220,12 +229,28 @@ def ytdl_download(url: str, dest_dir: str, max_bytes: int, ffmpeg_dir: str = Non
             path = ydl.prepare_filename(info)
     except Exception as e:
         raise MediaError(f"yt-dlp failed for {url}: {e}") from e
-    if not Path(path).exists():
-        candidates = sorted(dest_dir.glob(f"{info.get('id', '')}.*"))
-        if not candidates:
+
+    final = Path(path)
+    if not final.exists():
+        # yt-dlp may rename/merge streams / change extensions; validate the REAL
+        # resulting file, not the initially requested template name.
+        candidates = [c for c in dest_dir.glob(f"{info.get('id', '')}.*") if c.is_file()]
+        media_suffixes = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".m4v")
+        videos = [c for c in candidates if c.suffix.lower() in media_suffixes]
+        pool = videos or candidates
+        if not pool:
             raise MediaError(f"yt-dlp produced no file for {url}")
-        path = str(candidates[0])
-    return path
+        final = max(pool, key=lambda p: p.stat().st_size)
+
+    size = final.stat().st_size
+    if max_bytes is not None and size > max_bytes:
+        log.warning("rejecting yt-dlp output %s: %d bytes exceeds %d byte limit",
+                    final, size, max_bytes)
+        _remove_if_exists(final)
+        for part in final.parent.glob(f"{final.stem}.part*"):
+            _remove_if_exists(part)
+        raise MediaError(f"yt-dlp output for {url} exceeds {max_bytes} byte video limit")
+    return str(final)
 
 
 def trim_video(src_path: str, dest_dir: str, ffmpeg: str, ffprobe: str, max_seconds: float,
