@@ -165,6 +165,8 @@ class TestCmdOnce:
             "captcha",
             "login",
             "post_button_disabled_timeout",
+            "ambiguous_post_button",
+            "media_editor_unresolved",
         ]
     )
     def test_ambiguous_or_failed_publisher_never_records(self, tmp_path, reason):

@@ -12,7 +12,9 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from publisher.x_publisher import (
     ATTACHMENT_SELECTORS,
     COMPOSER_SELECTORS,
+    DIALOG_ANCESTOR_SELECTOR,
     FILE_INPUT_SELECTORS,
+    POST_BUTTON_QUERY,
     POST_BUTTON_SELECTORS,
     XSession,
 )
@@ -76,6 +78,18 @@ class FakeLocator:
     @property
     def first(self):
         return self
+
+    def nth(self, _index):
+        return self
+
+    def locator(self, selector):
+        if selector == DIALOG_ANCESTOR_SELECTOR:
+            self.page.present_selectors.add(DIALOG_ANCESTOR_SELECTOR)
+            self.page.visible_selectors.add(DIALOG_ANCESTOR_SELECTOR)
+            return self.page.locator(DIALOG_ANCESTOR_SELECTOR)
+        if selector == POST_BUTTON_QUERY:
+            return self.page.locator(POST_BTN)
+        return self.page.locator(selector)
 
     def set_input_files(self, paths):
         self.input_files = list(paths)
@@ -367,7 +381,10 @@ def test_stable_control_testids_do_not_require_html_tag_names():
     assert COMPOSER == '[data-testid="tweetTextarea_0"]'
     assert FILE_INPUT == '[data-testid="fileInput"]'
     assert ATTACHMENTS == '[data-testid="attachments"]'
-    assert POST_BTN == '[data-testid="tweetButtonInline"]'
+    assert POST_BUTTON_SELECTORS == (
+        '[data-testid="tweetButton"]',
+        '[data-testid="tweetButtonInline"]',
+    )
 
 
 def test_login_redirect_returns_failure(media):

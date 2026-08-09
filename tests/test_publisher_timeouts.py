@@ -13,7 +13,9 @@ import pytest
 from publisher.x_publisher import (
     ATTACHMENT_SELECTORS,
     COMPOSER_SELECTORS,
+    DIALOG_ANCESTOR_SELECTOR,
     FILE_INPUT_SELECTORS,
+    POST_BUTTON_QUERY,
     POST_BUTTON_SELECTORS,
     XSession,
 )
@@ -55,6 +57,18 @@ class FakeLocator:
     @property
     def first(self):
         return self
+
+    def nth(self, _index):
+        return self
+
+    def locator(self, selector):
+        if selector == DIALOG_ANCESTOR_SELECTOR:
+            self.page.present_selectors.add(DIALOG_ANCESTOR_SELECTOR)
+            self.page.visible_selectors.add(DIALOG_ANCESTOR_SELECTOR)
+            return self.page.locator(DIALOG_ANCESTOR_SELECTOR)
+        if selector == POST_BUTTON_QUERY:
+            return self.page.locator(POST_BTN)
+        return self.page.locator(selector)
 
     def set_input_files(self, paths):
         self.input_files = list(paths)

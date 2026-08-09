@@ -108,5 +108,9 @@ def test_login_paths_and_marker_are_independent_of_cwd(tmp_path, monkeypatch):
 
     assert Path(captured["user_data_dir"]) == (repo / "profile with spaces").resolve()
     assert Path(captured["executable_path"]) == (repo / "bin/Brave Browser.exe").resolve()
+    assert captured["headless"] is False
+    assert captured["no_viewport"] is True
+    assert "viewport" not in captured
+    assert captured["args"].count("--start-maximized") == 1
     assert (repo / "logs with spaces" / "logged_in.json").exists()
     assert not (unrelated / "logs with spaces" / "logged_in.json").exists()

@@ -8,6 +8,7 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
@@ -36,6 +37,7 @@ BROWSER_EXTRA_ARGS = [
     "--no-default-browser-check",
     "--disable-component-update",
     "--disable-blink-features=AutomationControlled",
+    "--start-maximized",
 ]
 
 # Injected on every page so X/Twitter (and other anti-bot pages) can't tell the
@@ -104,7 +106,24 @@ COMPOSER_SELECTORS = (
 )
 FILE_INPUT_SELECTORS = ('[data-testid="fileInput"]',)
 ATTACHMENT_SELECTORS = ('[data-testid="attachments"]',)
-POST_BUTTON_SELECTORS = ('[data-testid="tweetButtonInline"]',)
+POST_BUTTON_SELECTORS = (
+    '[data-testid="tweetButton"]',
+    '[data-testid="tweetButtonInline"]',
+)
+POST_BUTTON_QUERY = ", ".join(POST_BUTTON_SELECTORS)
+DIALOG_ANCESTOR_SELECTOR = "xpath=ancestor::*[@role='dialog'][1]"
+PRIMARY_COLUMN_ANCESTOR_SELECTOR = (
+    "xpath=ancestor::*[@data-testid='primaryColumn'][1]"
+)
+
+
+@dataclass(frozen=True)
+class ComposeSurface:
+    """One active composer and the nearest surface that owns its controls."""
+
+    root: object
+    composer: object
+    kind: str
 
 
 class PublishError(Exception):
@@ -228,7 +247,7 @@ class XSession:
                 user_data_dir=self.profile_dir,
                 executable_path=self.brave,
                 headless=False,
-                viewport={"width": 1280, "height": 900},
+                no_viewport=True,
                 user_agent=BRAVE_WINDOWS_UA,
                 locale="en-US",
                 args=list(BROWSER_EXTRA_ARGS),
@@ -359,6 +378,247 @@ class XSession:
     def _remaining_ms(deadline: float) -> int:
         return max(0, int((deadline - time.monotonic()) * 1000))
 
+    @staticmethod
+    def _surface_for_composer(composer) -> ComposeSurface | None:
+        """Derive the nearest visible owner for one visible composer node."""
+        for kind, ancestor_selector in (
+            ("dialog", DIALOG_ANCESTOR_SELECTOR),
+            ("primaryColumn", PRIMARY_COLUMN_ANCESTOR_SELECTOR),
+        ):
+            root = composer.locator(ancestor_selector)
+            if root.count() == 1 and root.is_visible():
+                return ComposeSurface(root=root, composer=composer, kind=kind)
+        return None
+
+    @classmethod
+    def _find_active_compose_surface(
+        cls, page: Page, *, timeout_ms: int
+    ) -> ComposeSurface:
+        """Find one composer, preferring an active modal over inline compose.
+
+        X can render the Home inline composer behind ``/compose/post``. A
+        visible composer inside its nearest visible dialog therefore owns the
+        operation; DOM order is never used to choose between the modal and the
+        underlying timeline composer.
+        """
+        selectors = tuple(COMPOSER_SELECTORS)
+        per_selector_timeout = max(1, timeout_ms // max(1, len(selectors)))
+        rootless_composer_seen = False
+        for selector in selectors:
+            visible = page.locator(selector).filter(visible=True)
+            try:
+                # This waits only for existence. Selection below enumerates and
+                # classifies every visible candidate by ownership.
+                visible.first.wait_for(
+                    state="visible", timeout=per_selector_timeout
+                )
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
+                continue
+
+            modal_surfaces = []
+            inline_surfaces = []
+            try:
+                count = visible.count()
+                for index in range(count):
+                    composer = visible.nth(index)
+                    surface = cls._surface_for_composer(composer)
+                    if surface is None:
+                        rootless_composer_seen = True
+                    elif surface.kind == "dialog":
+                        modal_surfaces.append(surface)
+                    else:
+                        inline_surfaces.append(surface)
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
+                continue
+
+            preferred = modal_surfaces or inline_surfaces
+            if len(preferred) == 1:
+                return preferred[0]
+            if len(preferred) > 1:
+                diagnostics = cls._bounded_dom_diagnostics(page)
+                log.warning(
+                    "ambiguous active X composers: selector=%r kind=%r count=%d "
+                    "dom=%r",
+                    selector,
+                    preferred[0].kind,
+                    len(preferred),
+                    diagnostics,
+                )
+                raise PublishError("ambiguous_composer")
+
+        cls._log_dom_failure(page, "composer", selectors)
+        if rootless_composer_seen:
+            raise PublishError(
+                "compose_root_not_found: visible composer had no owned dialog "
+                "or primaryColumn"
+            )
+        raise PublishError(
+            "composer_not_found: known X composer selectors were not visible"
+        )
+
+    @staticmethod
+    def _video_attachment_state(attachment) -> str:
+        """Classify X's inline caption-file/video-status attachment text.
+
+        Live DOM evidence shows ``Upload caption file (.srt)`` and
+        ``<filename>: Ready`` inside ``[data-testid=attachments]``. It is
+        informational attachment state, not an editor completion dialog.
+        """
+        try:
+            text = " ".join((attachment.inner_text(timeout=1000) or "").split())
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return "unavailable"
+        if "upload caption file (.srt)" not in text.casefold():
+            return "not_detected"
+        if re.search(r"\b(?:failed|error|could not be processed)\b", text, re.I):
+            return "attachment_inline_error"
+        if re.search(r"\bready\b", text, re.I):
+            return "attachment_inline_ready"
+        if re.search(r"\b(?:processing|uploading)\b", text, re.I):
+            return "attachment_inline_processing"
+        return "attachment_inline_present"
+
+    @staticmethod
+    def _secondary_video_editor_state(page) -> dict:
+        """Detect a distinct visible media dialog without guessing an action."""
+        script = r"""
+() => {
+  const visible = (el) => {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" &&
+      Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const composers = [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')]
+    .filter(visible);
+  const modalComposers = composers.filter((el) => {
+    const dialog = el.closest('[role="dialog"]');
+    return dialog && visible(dialog);
+  });
+  const composer = modalComposers.length === 1 ? modalComposers[0] :
+    (composers.length === 1 ? composers[0] : null);
+  if (!composer) return {state: "unavailable", dialog_count: 0, action_candidates: []};
+  const dialogs = [...document.querySelectorAll('[role="dialog"]')]
+    .filter(visible)
+    .filter((dialog) => !dialog.contains(composer))
+    .filter((dialog) => /Upload caption file \(\.srt\)/i.test(dialog.innerText || ""));
+  if (!dialogs.length) return {state: "no_editor", dialog_count: 0, action_candidates: []};
+  const text = dialogs.map((dialog) => dialog.innerText || "").join(" ");
+  let state = "secondary_present";
+  if (/\b(?:failed|error|could not be processed)\b/i.test(text)) state = "secondary_error";
+  else if (/\bready\b/i.test(text)) state = "secondary_ready";
+  else if (/\b(?:processing|uploading)\b/i.test(text)) state = "secondary_processing";
+  const actions = dialogs.flatMap((dialog) => [...dialog.querySelectorAll('button')])
+    .filter(visible)
+    .slice(0, 12)
+    .map((button) => ({
+      testid: button.getAttribute('data-testid'),
+      aria_label: button.getAttribute('aria-label'),
+      title: button.getAttribute('title'),
+      text: (button.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    }));
+  return {state, dialog_count: dialogs.length, action_candidates: actions};
+}
+"""
+        try:
+            value = page.evaluate(script)
+            if isinstance(value, dict):
+                return value
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+        return {"state": "unavailable", "dialog_count": 0, "action_candidates": []}
+
+    @staticmethod
+    def _bounded_dom_diagnostics(page) -> dict:
+        """Return bounded ownership diagnostics without page HTML or caption text."""
+        script = r"""
+() => {
+  const visible = (el) => {
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" &&
+      Number(style.opacity || 1) !== 0 && rect.width > 0 && rect.height > 0;
+  };
+  const composers = [...document.querySelectorAll('[data-testid="tweetTextarea_0"]')]
+    .filter(visible);
+  const modalComposers = composers.filter((el) => {
+    const dialog = el.closest('[role="dialog"]');
+    return dialog && visible(dialog);
+  });
+  const composer = modalComposers.length === 1 ? modalComposers[0] :
+    (composers.length === 1 ? composers[0] : null);
+  const dialogRoot = composer && composer.closest('[role="dialog"]');
+  const primaryRoot = composer && composer.closest('[data-testid="primaryColumn"]');
+  const root = dialogRoot || primaryRoot || null;
+  const safeText = (el) => {
+    let text = (el && el.innerText || "").replace(/\s+/g, " ").trim();
+    const caption = (composer && composer.innerText || "").replace(/\s+/g, " ").trim();
+    if (caption) text = text.replace(caption, "<composer-text>");
+    return text.slice(0, 260);
+  };
+  const buttons = [...document.querySelectorAll(
+    '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
+  )].slice(0, 12).map((button, index) => {
+    const rect = button.getBoundingClientRect();
+    const dialog = button.closest('[role="dialog"]');
+    return {
+      index,
+      testid: button.getAttribute('data-testid'),
+      visible: visible(button),
+      enabled: !button.disabled && button.getAttribute('aria-disabled') !== 'true',
+      aria_disabled: button.getAttribute('aria-disabled'),
+      disabled_attribute: button.hasAttribute('disabled'),
+      name: (button.getAttribute('aria-label') || button.innerText || "").trim().slice(0, 80),
+      inside_active_compose: Boolean(root && root.contains(button)),
+      dialog_text: safeText(dialog),
+      bounding_box: rect.width && rect.height ? {
+        x: Math.round(rect.x), y: Math.round(rect.y),
+        width: Math.round(rect.width), height: Math.round(rect.height),
+      } : null,
+    };
+  });
+  const dialogs = [...document.querySelectorAll('[role="dialog"]')]
+    .slice(0, 12).map((dialog, index) => ({
+      index,
+      visible: visible(dialog),
+      testid: dialog.getAttribute('data-testid'),
+      contains_active_composer: Boolean(composer && dialog.contains(composer)),
+      contains_attachment: Boolean(dialog.querySelector('[data-testid="attachments"]')),
+      post_button_count: dialog.querySelectorAll(
+        '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
+      ).length,
+      media_editor_markers: {
+        srt: /Upload caption file \(\.srt\)/i.test(dialog.innerText || ""),
+        ready: /\bReady\b/i.test(dialog.innerText || ""),
+      },
+      text: safeText(dialog),
+    }));
+  const secondary = dialogs.filter((dialog) =>
+    dialog.visible && !dialog.contains_active_composer && dialog.media_editor_markers.srt
+  );
+  return {
+    active_compose_root: dialogRoot ? "dialog" : primaryRoot ? "primaryColumn" : null,
+    post_button_candidates: buttons,
+    visible_dialogs: dialogs,
+    secondary_media_editor: secondary.length ? secondary : null,
+  };
+}
+"""
+        try:
+            value = page.evaluate(script)
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return {}
+
     @classmethod
     def _readiness_diagnostics(
         cls,
@@ -370,6 +630,7 @@ class XSession:
         media_kind,
         configured_timeout_seconds,
         readiness_started_at,
+        compose_surface=None,
         detected_problem=None,
         media_error=None,
     ) -> dict:
@@ -389,6 +650,10 @@ class XSession:
             "url": "<unavailable>",
             "detected_problem": detected_problem,
             "media_error": media_error,
+            "compose_root_kind": (
+                compose_surface.kind if compose_surface is not None else None
+            ),
+            "video_media_state": cls._video_attachment_state(attachment),
         }
         checks = (
             ("button_visible", lambda: post_btn.is_visible()),
@@ -403,6 +668,7 @@ class XSession:
                 diagnostics[key] = check()
             except Exception:
                 diagnostics[key] = "error"
+        diagnostics.update(cls._bounded_dom_diagnostics(page))
         return diagnostics
 
     @classmethod
@@ -418,12 +684,21 @@ class XSession:
         media_kind="image",
         configured_timeout_seconds=60,
         readiness_started_at=None,
+        compose_surface=None,
     ) -> dict:
         """Wait until the visible Post button is enabled within one deadline."""
         if readiness_started_at is None:
             readiness_started_at = time.monotonic()
         last_state = {"visible": False, "enabled": False}
         announced_video_wait = False
+        announced_inline_ready = False
+        editor_state = {
+            "state": "no_editor",
+            "dialog_count": 0,
+            "action_candidates": [],
+        }
+        editor_blocks_post = False
+        last_editor_check_at = None
         while True:
             remaining_ms = cls._remaining_ms(deadline)
             body_text = ""
@@ -447,6 +722,7 @@ class XSession:
                     media_kind=media_kind,
                     configured_timeout_seconds=configured_timeout_seconds,
                     readiness_started_at=readiness_started_at,
+                    compose_surface=compose_surface,
                     media_error=media_error,
                 )
                 log.warning("X media readiness failure: %r", diagnostics)
@@ -471,6 +747,7 @@ class XSession:
                     media_kind=media_kind,
                     configured_timeout_seconds=configured_timeout_seconds,
                     readiness_started_at=readiness_started_at,
+                    compose_surface=compose_surface,
                 )
                 log.warning("X attachment disappeared during readiness: %r", diagnostics)
                 return {
@@ -478,6 +755,56 @@ class XSession:
                     "reason": "attachment_missing_during_readiness",
                     "remaining_ms": remaining_ms,
                 }
+
+            video_media_state = cls._video_attachment_state(attachment)
+            if video_media_state == "attachment_inline_error":
+                return {
+                    "ready": False,
+                    "reason": "media_upload_error:media_processing_failed",
+                    "remaining_ms": remaining_ms,
+                }
+            if (
+                media_kind == "video"
+                and video_media_state == "attachment_inline_ready"
+                and not announced_inline_ready
+            ):
+                log.info(
+                    "X video attachment reports Ready inside the active compose; "
+                    "no editor completion action is required by this DOM state"
+                )
+                announced_inline_ready = True
+
+            now = time.monotonic()
+            if media_kind == "video" and (
+                last_editor_check_at is None or now - last_editor_check_at >= 1.0
+            ):
+                editor_state = cls._secondary_video_editor_state(page)
+                last_editor_check_at = now
+                editor_blocks_post = editor_state.get("state") in {
+                    "secondary_present",
+                    "secondary_processing",
+                }
+                if editor_state.get("state") == "secondary_error":
+                    log.warning("X secondary media editor error: %r", editor_state)
+                    return {
+                        "ready": False,
+                        "reason": "media_upload_error:media_processing_failed",
+                        "remaining_ms": remaining_ms,
+                    }
+                if editor_state.get("state") == "secondary_ready":
+                    # The live X DOM captured for this repair has no secondary
+                    # editor and no completion control. If a future DOM does,
+                    # fail instead of guessing Done/Save/Close semantics.
+                    log.warning(
+                        "X secondary media editor is ready but has no verified "
+                        "completion contract: %r",
+                        editor_state,
+                    )
+                    return {
+                        "ready": False,
+                        "reason": "media_editor_unresolved",
+                        "remaining_ms": remaining_ms,
+                    }
 
             try:
                 last_state["visible"] = bool(post_btn.is_visible())
@@ -488,7 +815,12 @@ class XSession:
                 last_state = {"visible": False, "enabled": False}
 
             remaining_ms = cls._remaining_ms(deadline)
-            if last_state["visible"] and last_state["enabled"] and remaining_ms > 0:
+            if (
+                last_state["visible"]
+                and last_state["enabled"]
+                and not editor_blocks_post
+                and remaining_ms > 0
+            ):
                 if announced_video_wait:
                     elapsed = max(0.0, time.monotonic() - readiness_started_at)
                     log.info("X video Post button enabled after %.1fs", elapsed)
@@ -508,7 +840,9 @@ class XSession:
                     media_kind=media_kind,
                     configured_timeout_seconds=configured_timeout_seconds,
                     readiness_started_at=readiness_started_at,
+                    compose_surface=compose_surface,
                 )
+                diagnostics["secondary_media_editor_state"] = editor_state
                 log.warning("X Post button readiness timed out: %r", diagnostics)
                 return {
                     "ready": False,
@@ -538,51 +872,101 @@ class XSession:
             detected_problem = cls.detect_problem(page)
         except Exception:
             detected_problem = None
+        dom_diagnostics = cls._bounded_dom_diagnostics(page)
         log.warning(
             "%s selector failure: url=%r title=%r detected_problem=%r "
-            "selector_counts=%r",
+            "selector_counts=%r dom=%r",
             stage,
             url,
             title,
             detected_problem,
             selector_counts,
+            dom_diagnostics,
         )
 
     @classmethod
-    def _first_matching_locator(
+    def _unique_matching_locator(
         cls,
         page: Page,
+        scope,
         selectors,
         *,
         state: str,
         timeout_ms: int,
         failure_reason: str,
+        ambiguity_reason: str,
         stage: str,
     ):
-        """Return the first ordered selector matching the requested state.
+        """Return one control within an already established ownership scope.
 
         The total caller timeout is divided across selectors, keeping fallback
-        discovery bounded instead of multiplying the configured timeout by the
-        number of fallbacks. Visible lookups filter hidden duplicate nodes
-        before selecting ``first``.
+        discovery bounded. A matching selector must resolve to exactly one
+        control; ambiguity fails instead of picking a DOM position.
         """
         selectors = tuple(selectors)
         per_selector_timeout = max(1, timeout_ms // max(1, len(selectors)))
         for selector in selectors:
-            locator = page.locator(selector)
+            locator = scope.locator(selector)
             if state == "visible":
                 locator = locator.filter(visible=True)
-            candidate = locator.first
             try:
-                candidate.wait_for(
+                # ``first`` is used only to wait for any match. The returned
+                # control is selected below only after an exact count check.
+                locator.first.wait_for(
                     state=state,
                     timeout=per_selector_timeout,
                 )
-                return candidate
-            except Exception:
+                count = locator.count()
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
                 continue
+            if count == 1:
+                return locator.nth(0)
+            if count > 1:
+                diagnostics = cls._bounded_dom_diagnostics(page)
+                log.warning(
+                    "%s ambiguity: reason=%s selector=%r owned_count=%d dom=%r",
+                    stage,
+                    ambiguity_reason,
+                    selector,
+                    count,
+                    diagnostics,
+                )
+                raise PublishError(ambiguity_reason)
         cls._log_dom_failure(page, stage, selectors)
         raise PublishError(failure_reason)
+
+    @classmethod
+    def _find_owned_post_button(
+        cls,
+        page: Page,
+        surface: ComposeSurface,
+        *,
+        timeout_ms: int,
+    ):
+        """Return the sole visible Post candidate owned by ``surface``."""
+        candidates = surface.root.locator(POST_BUTTON_QUERY).filter(visible=True)
+        try:
+            candidates.first.wait_for(state="visible", timeout=timeout_ms)
+            count = candidates.count()
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            cls._log_dom_failure(page, "post_button", POST_BUTTON_SELECTORS)
+            raise PublishError(
+                "post_button_not_found: active X compose owned no visible Post button"
+            ) from None
+        if count != 1:
+            diagnostics = cls._bounded_dom_diagnostics(page)
+            log.warning(
+                "post_button ambiguity: reason=ambiguous_post_button "
+                "owned_visible_count=%d dom=%r",
+                count,
+                diagnostics,
+            )
+            raise PublishError("ambiguous_post_button")
+        return candidates.nth(0)
 
     # ------------------------------------------------------------- posting
 
@@ -619,33 +1003,31 @@ class XSession:
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
-            composer = self._first_matching_locator(
-                page,
-                COMPOSER_SELECTORS,
-                state="visible",
-                timeout_ms=timeout_ms,
-                failure_reason=(
-                    "composer_not_found: known X composer selectors were not visible"
-                ),
-                stage="composer",
+            compose = self._find_active_compose_surface(
+                page, timeout_ms=timeout_ms
             )
+            composer = compose.composer
 
-            file_input = self._first_matching_locator(
+            file_input = self._unique_matching_locator(
                 page,
+                compose.root,
                 FILE_INPUT_SELECTORS,
                 state="attached",
                 timeout_ms=timeout_ms,
                 failure_reason="file_input_not_found: X media input was not attached",
+                ambiguity_reason="ambiguous_file_input",
                 stage="file_input",
             )
             file_input.set_input_files(media_paths)
 
-            attachment = self._first_matching_locator(
+            attachment = self._unique_matching_locator(
                 page,
+                compose.root,
                 ATTACHMENT_SELECTORS,
                 state="visible",
                 timeout_ms=timeout_ms,
                 failure_reason="attachments_not_found: X media attachment was not visible",
+                ambiguity_reason="ambiguous_attachments",
                 stage="attachments",
             )
 
@@ -661,13 +1043,10 @@ class XSession:
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
-            post_btn = self._first_matching_locator(
+            post_btn = self._find_owned_post_button(
                 page,
-                POST_BUTTON_SELECTORS,
-                state="attached",
+                compose,
                 timeout_ms=timeout_ms,
-                failure_reason="post_button_not_found: X Post button was not attached",
-                stage="post_button",
             )
             readiness_started_at = time.monotonic()
             readiness_deadline = (
@@ -683,6 +1062,7 @@ class XSession:
                 media_kind=media_kind,
                 configured_timeout_seconds=ready_timeout_ms / 1000.0,
                 readiness_started_at=readiness_started_at,
+                compose_surface=compose,
             )
             if not readiness["ready"]:
                 return {"ok": False, "reason": readiness["reason"]}
@@ -700,6 +1080,7 @@ class XSession:
                     media_kind=media_kind,
                     configured_timeout_seconds=ready_timeout_ms / 1000.0,
                     readiness_started_at=readiness_started_at,
+                    compose_surface=compose,
                 )
                 log.warning("X Post button click timed out: %r", diagnostics)
                 return {"ok": False, "reason": "post_button_click_timeout"}

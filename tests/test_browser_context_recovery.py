@@ -81,6 +81,7 @@ class FakePlaywright:
     def __init__(self, context=None):
         self.context = context
         self.launch_calls = 0
+        self.launch_kwargs = []
         self.stop_calls = 0
         self.chromium = SimpleNamespace(
             launch_persistent_context=self.launch_persistent_context
@@ -88,6 +89,7 @@ class FakePlaywright:
 
     def launch_persistent_context(self, **kwargs):
         self.launch_calls += 1
+        self.launch_kwargs.append(kwargs)
         if isinstance(self.context, BaseException):
             raise self.context
         return self.context
@@ -174,6 +176,21 @@ def test_start_replaces_a_disconnected_context():
     assert old.close_calls == old_driver.stop_calls == 1
     assert fresh_driver.launch_calls == 1
     assert session._context is fresh
+
+
+def test_xsession_launch_uses_native_maximized_viewport():
+    context = FakeContext([])
+    driver = FakePlaywright(context)
+    session = XSession({"browser_profile": "profile", "brave": "brave"})
+
+    with mock.patch("publisher.x_publisher.sync_playwright", _sync_factory(driver)):
+        session.start()
+
+    options = driver.launch_kwargs[0]
+    assert options["headless"] is False
+    assert options["no_viewport"] is True
+    assert "viewport" not in options
+    assert options["args"].count("--start-maximized") == 1
 
 
 def test_first_new_page_target_closed_restarts_once_then_succeeds():
