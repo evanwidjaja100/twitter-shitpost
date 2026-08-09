@@ -286,7 +286,8 @@ class _FakeXContext:
 
 
 def _x_session(cookies=None):
-    return SimpleNamespace(_context=_FakeXContext(cookies))
+    context = _FakeXContext(cookies)
+    return SimpleNamespace(cookies=context.cookies)
 
 
 def _x_item(url="https://pbs.twimg.com/media/photo.jpg", source_id="tweet123"):

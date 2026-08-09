@@ -18,6 +18,13 @@ log = logging.getLogger("youtube")
 _SHORTS_RE = re.compile(r"/shorts/([\w-]{6,})")
 
 
+def _raise_if_context_closed(exc: Exception) -> None:
+    from publisher.x_publisher import is_closed_context_error
+
+    if is_closed_context_error(exc):
+        raise exc
+
+
 def _parse_views(text) -> int:
     """'1.2M views' -> 1200000, '340K views' -> 340000, '5 views' -> 5."""
     m = re.search(r"([\d.]+)\s*([KMB]?)\s*views", text or "", re.IGNORECASE)
@@ -38,15 +45,15 @@ def scrape_shorts(session, config: dict) -> list[dict]:
 
     items: list[dict] = []
     seen: set[str] = set()
-    context = session._context
-    page = context.new_page()
+    page = session.new_page()
     try:
         page.goto("https://www.youtube.com/", wait_until="domcontentloaded", timeout=45000)
         page.wait_for_timeout(4000)
         for _ in range(scrolls):
             try:
                 page.mouse.wheel(0, 2600)
-            except Exception:
+            except Exception as exc:
+                _raise_if_context_closed(exc)
                 pass
             page.wait_for_timeout(random.randint(1500, 2500))
 
@@ -68,7 +75,8 @@ def scrape_shorts(session, config: dict) -> list[dict]:
                         t = card.first.locator("#video-title").first
                         if t.count():
                             title = t.inner_text(timeout=1500).strip()[:200]
-                except Exception:
+                except Exception as exc:
+                    _raise_if_context_closed(exc)
                     pass
                 if views < min_views:
                     continue
@@ -87,6 +95,7 @@ def scrape_shorts(session, config: dict) -> list[dict]:
                     }
                 )
             except Exception as e:
+                _raise_if_context_closed(e)
                 log.debug("shorts parse skipped: %s", e)
             if len(items) >= max_items:
                 break

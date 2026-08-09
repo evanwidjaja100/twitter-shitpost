@@ -33,6 +33,14 @@ from scrapers._dom import first_matching_locator, iter_matching_nodes
 
 log = logging.getLogger("tiktok")
 
+
+def _raise_if_context_closed(exc: Exception) -> None:
+    from publisher.x_publisher import is_closed_context_error
+
+    if is_closed_context_error(exc):
+        raise exc
+
+
 # Ordered, conservative selectors. The first card selector is the current
 # production one; later entries are safe alternatives. Everything is scoped:
 # ``first_matching_locator`` returns the first selector that matches and
@@ -149,7 +157,8 @@ def _extract_feed_card(card, stats: dict | None = None) -> dict | None:
         if lik_loc is not None:
             try:
                 likes = _parse_count(lik_loc.inner_text(timeout=1500))
-            except Exception:
+            except Exception as exc:
+                _raise_if_context_closed(exc)
                 likes = 0
 
         caption = ""
@@ -157,13 +166,15 @@ def _extract_feed_card(card, stats: dict | None = None) -> dict | None:
         if desc_loc is not None:
             try:
                 caption = (desc_loc.inner_text(timeout=1500) or "").strip()[:200]
-            except Exception:
+            except Exception as exc:
+                _raise_if_context_closed(exc)
                 caption = ""
 
         if success:
             stats["parsed"] += 1
         return _card(href, likes, caption)
     except Exception as e:
+        _raise_if_context_closed(e)
         if success:
             stats["incomplete"] += 1
         log.debug("tiktok feed card parse skipped: %s", e)
@@ -215,7 +226,8 @@ def _collect_feed_with_stats(page, max_posts: int, scrolls: int):
                 return list(merged.values()), stats
         try:
             page.mouse.wheel(0, 3000)
-        except Exception:
+        except Exception as exc:
+            _raise_if_context_closed(exc)
             pass
         page.wait_for_timeout(random.randint(1800, 2800))
     return list(merged.values()), stats
@@ -266,14 +278,14 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     items: list[dict] = []
     collected: dict[str, dict] = {}
     handle_for: dict[str, str] = {}
-    context = session._context
-    page = context.new_page()
+    page = session.new_page()
     try:
         if foryou or not accounts:
             try:
                 page.goto("https://www.tiktok.com/", wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(4000)
             except Exception as e:
+                _raise_if_context_closed(e)
                 log.warning("tiktok feed load failed: %s", e)
                 return items
             cards, feed_stats = _collect_feed_with_stats(page, max_posts, scrolls)
@@ -298,6 +310,7 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                     page.mouse.wheel(0, 2200)
                     page.wait_for_timeout(random.randint(2000, 3200))
             except Exception as e:
+                _raise_if_context_closed(e)
                 log.warning("profile %s failed: %s", handle, e)
                 continue
 

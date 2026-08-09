@@ -113,7 +113,7 @@ class FakeContext:
 
 
 def _session(page):
-    return SimpleNamespace(_context=FakeContext(page))
+    return SimpleNamespace(new_page=lambda: page)
 
 
 # ------------------------------------------------------------- Issue 1A: X

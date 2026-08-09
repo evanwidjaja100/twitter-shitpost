@@ -216,6 +216,24 @@ def prepare_item(item: dict, cfg: dict, paths: dict, session=None):
         return None
 
 
+def _scrape_source(name: str, scrape):
+    """Run one source without hiding unrecoverable browser-session failures."""
+    try:
+        return scrape()
+    except Exception as exc:
+        from publisher.x_publisher import BrowserSessionError, is_closed_context_error
+
+        if isinstance(exc, BrowserSessionError) or is_closed_context_error(exc):
+            raise
+        logging.getLogger("select").warning(
+            "%s source failed (%s); continuing with remaining sources: %s",
+            name,
+            type(exc).__name__,
+            exc,
+        )
+        return []
+
+
 def pick_item(cfg: dict, db, session=None) -> dict | None:
     """Scrape all sources, dedup against history, and return the single best
     postable item. Nothing is recorded here — dedup happens only after a
@@ -231,27 +249,50 @@ def pick_item(cfg: dict, db, session=None) -> dict | None:
     if (tiktok.get("foryou") or tiktok.get("accounts")) and session is not None:
         from scrapers import tiktok_scraper
 
-        items += tiktok_scraper.scrape(
-            session, tiktok, str(BASE / cfg["paths"]["assets_dir"])
+        items += _scrape_source(
+            "TikTok",
+            lambda: tiktok_scraper.scrape(
+                session, tiktok, str(BASE / cfg["paths"]["assets_dir"])
+            ),
         )
 
     if secrets.get("youtube_api_key"):
         from googleapiclient.discovery import build
 
-        yt = build("youtube", "v3", developerKey=secrets["youtube_api_key"], cache_discovery=False)
         from scrapers import youtube_scraper
 
-        items += youtube_scraper.scrape(yt, cfg["youtube"])
+        items += _scrape_source(
+            "YouTube API",
+            lambda: youtube_scraper.scrape(
+                build(
+                    "youtube",
+                    "v3",
+                    developerKey=secrets["youtube_api_key"],
+                    cache_discovery=False,
+                ),
+                cfg["youtube"],
+            ),
+        )
 
     if cfg.get("youtube", {}).get("shorts_feed") and session is not None:
         from scrapers import youtube_scraper
 
-        items += youtube_scraper.scrape_shorts(session, cfg["youtube"])
+        items += _scrape_source(
+            "YouTube Shorts",
+            lambda: youtube_scraper.scrape_shorts(session, cfg["youtube"]),
+        )
 
     if cfg["x_sources"].get("accounts") and session is not None:
         from scrapers import x_scraper
 
-        items += x_scraper.scrape(session, cfg["x_sources"], str(BASE / cfg["paths"]["assets_dir"]))
+        items += _scrape_source(
+            "X",
+            lambda: x_scraper.scrape(
+                session,
+                cfg["x_sources"],
+                str(BASE / cfg["paths"]["assets_dir"]),
+            ),
+        )
 
     log.info("scraped %d candidates", len(items))
 

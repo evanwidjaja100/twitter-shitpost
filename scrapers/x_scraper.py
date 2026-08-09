@@ -24,6 +24,14 @@ from scrapers._dom import first_matching_locator, iter_matching_nodes
 
 log = logging.getLogger("x_scraper")
 
+
+def _raise_if_global_browser_error(exc: Exception) -> None:
+    from publisher.x_publisher import BrowserSessionError, is_closed_context_error
+
+    if isinstance(exc, BrowserSessionError) or is_closed_context_error(exc):
+        raise exc
+
+
 # Ordered, known-safe selectors. The first key is the current production
 # selector; later entries are conservative fallbacks for DOM drift. Fallbacks
 # MUST stay scoped to the same element kind — broad selectors that could match
@@ -80,7 +88,8 @@ def _first_text(scope, selector_key: str, timeout_ms: int = 2000) -> str:
         return ""
     try:
         return (loc.inner_text(timeout=timeout_ms) or "")[:500]
-    except Exception:
+    except Exception as exc:
+        _raise_if_global_browser_error(exc)
         return ""
 
 
@@ -114,7 +123,8 @@ def _parse_article(article, min_likes: int) -> dict | None:
     if like_loc is not None:
         try:
             likes = _parse_count(like_loc.inner_text(timeout=2000))
-        except Exception:
+        except Exception as exc:
+            _raise_if_global_browser_error(exc)
             likes = 0  # unparseable/missing = 0, never the threshold
     if likes < min_likes:
         return None
@@ -124,7 +134,8 @@ def _parse_article(article, min_likes: int) -> dict | None:
     if link_loc is not None:
         try:
             link = link_loc.get_attribute("href") or ""
-        except Exception:
+        except Exception as exc:
+            _raise_if_global_browser_error(exc)
             link = ""
     if not link:
         return None
@@ -173,8 +184,7 @@ def _scrape_site(session, config: dict, assets_dir: str):
     scrolls = config.get("scrolls", 3)
 
     items: list[dict] = []
-    context = session._context
-    page = context.new_page()
+    page = session.new_page()
     try:
         for handle in accounts:
             handle = handle.lstrip("@")
@@ -185,6 +195,7 @@ def _scrape_site(session, config: dict, assets_dir: str):
                     page.mouse.wheel(0, 2000)
                     page.wait_for_timeout(random.randint(2000, 3500))
             except Exception as e:
+                _raise_if_global_browser_error(e)
                 log.warning("profile %s failed: %s", handle, e)
                 continue
 
@@ -215,6 +226,7 @@ def _scrape_site(session, config: dict, assets_dir: str):
                     if collected >= max_posts:
                         break
                 except Exception as e:
+                    _raise_if_global_browser_error(e)
                     log.debug("tweet parse skipped: %s", e)
                     continue
     finally:
@@ -264,12 +276,12 @@ def _copy_cookies(session, url: str) -> dict:
     X media hosts (pbs.twimg.com) are typically public, so this is usually an
     empty map. If the context has no usable cookie API, an empty map is used.
     """
-    ctx = getattr(session, "_context", None)
-    if ctx is None or not hasattr(ctx, "cookies"):
+    if not hasattr(session, "cookies"):
         return {}
     try:
-        raw = ctx.cookies()
-    except Exception:
+        raw = session.cookies()
+    except Exception as exc:
+        _raise_if_global_browser_error(exc)
         return {}
     host = urlparse(url).hostname if url else ""
     return {

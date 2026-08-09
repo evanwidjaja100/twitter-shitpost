@@ -25,6 +25,8 @@ Rules enforced by design:
   distinguish "no qualifying candidates" from "the page structure disappeared".
 """
 
+from publisher.x_publisher import is_closed_context_error
+
 
 def first_matching_locator(scope, selectors):
     """Return ``scope.locator(sel).first`` for the first selector in
@@ -38,7 +40,9 @@ def first_matching_locator(scope, selectors):
             loc = scope.locator(selector)
             if loc.count():
                 return loc.first
-        except Exception:
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
             continue
     return None
 
@@ -52,6 +56,8 @@ def iter_matching_nodes(scope, selectors):
             loc = scope.locator(selector)
             if loc.count():
                 return loc.all()
-        except Exception:
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
             continue
     return []

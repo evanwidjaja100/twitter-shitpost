@@ -119,7 +119,7 @@ class FakeContext:
 
 
 def _session(page):
-    return SimpleNamespace(_context=FakeContext(page))
+    return SimpleNamespace(new_page=lambda: page)
 
 
 def _x_tweet_card(status_id, likes, has_img=True, has_link=True):

@@ -10,6 +10,7 @@ import re
 import time
 from pathlib import Path
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 
 log = logging.getLogger("publisher")
@@ -98,6 +99,33 @@ class PublishError(Exception):
     """Raised when a required compose control cannot be located safely."""
 
 
+class BrowserSessionError(RuntimeError):
+    """The persistent browser session could not be made usable safely."""
+
+
+def is_closed_context_error(exc: Exception) -> bool:
+    """Narrowly classify Playwright browser/context closure failures.
+
+    Playwright does not publicly export ``TargetClosedError`` in the installed
+    API, but it is a subclass of the public :class:`PlaywrightError`. Use the
+    concrete class name plus Playwright's stable closed-target messages without
+    importing undocumented implementation modules.
+    """
+    if not isinstance(exc, PlaywrightError):
+        return False
+    if type(exc).__name__ == "TargetClosedError":
+        return True
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "target page, context or browser has been closed",
+            "browsercontext has been closed",
+            "browser has been closed",
+        )
+    )
+
+
 def load_config_paths(config_path=None) -> dict:
     """Load paths only after the complete config passes central validation."""
     from config_validation import load_validated_config
@@ -136,34 +164,123 @@ class XSession:
         self.brave = resolve_config_path(paths, "brave")
         self._playwright = None
         self._context = None
+        self._intentionally_stopped = False
 
     def start(self):
-        if self._context is not None:
-            return
+        """Explicitly ensure a healthy persistent context exists."""
+        self._intentionally_stopped = False
+        self._ensure_healthy_context()
+
+    def _context_is_healthy(self) -> bool:
+        """Check context health using public Playwright API surfaces."""
+        context = self._context
+        if context is None:
+            return False
+        try:
+            browser = context.browser
+            if browser is not None and not browser.is_connected():
+                return False
+            # Accessing public context state also rejects some already-closed
+            # implementations even when a browser handle is unavailable.
+            context.pages
+            return True
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                return False
+            raise
+
+    def _cleanup_session_state(self) -> None:
+        """Clear and best-effort close one exact stale context/driver pair."""
+        context, playwright = self._context, self._playwright
+        self._context = None
+        self._playwright = None
+        if context is not None:
+            try:
+                context.close()
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    log.debug("stale browser context was already closed")
+                else:
+                    log.warning("error closing stale browser context", exc_info=True)
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                log.warning("error stopping stale Playwright handle", exc_info=True)
+
+    def _launch_context(self) -> None:
+        """Launch one persistent context, cleaning partial state on failure."""
         self._playwright = sync_playwright().start()
-        self._context = self._playwright.chromium.launch_persistent_context(
-            user_data_dir=self.profile_dir,
-            executable_path=self.brave,
-            headless=False,
-            viewport={"width": 1280, "height": 900},
-            user_agent=BRAVE_WINDOWS_UA,
-            locale="en-US",
-            args=list(BROWSER_EXTRA_ARGS),
-        )
-        install_anti_detection(self._context)
+        try:
+            self._context = self._playwright.chromium.launch_persistent_context(
+                user_data_dir=self.profile_dir,
+                executable_path=self.brave,
+                headless=False,
+                viewport={"width": 1280, "height": 900},
+                user_agent=BRAVE_WINDOWS_UA,
+                locale="en-US",
+                args=list(BROWSER_EXTRA_ARGS),
+            )
+            install_anti_detection(self._context)
+        except Exception:
+            self._cleanup_session_state()
+            raise
+
+    def _ensure_healthy_context(self) -> bool:
+        """Ensure usability; return True only when stale state was replaced."""
+        if self._intentionally_stopped:
+            raise BrowserSessionError(
+                "browser session was intentionally stopped; call start() explicitly"
+            )
+        if self._context_is_healthy():
+            return False
+        had_stale_state = self._context is not None or self._playwright is not None
+        if had_stale_state:
+            log.warning("stale browser context detected; rebuilding persistent session")
+            self._cleanup_session_state()
+        self._launch_context()
+        return had_stale_state
 
     def stop(self):
-        try:
-            if self._context is not None:
-                self._context.close()
-        finally:
-            if self._playwright is not None:
-                self._playwright.stop()
-            self._context = None
-            self._playwright = None
+        self._intentionally_stopped = True
+        self._cleanup_session_state()
 
     def new_page(self) -> Page:
-        return self._context.new_page()
+        """Create a page, rebuilding a context at most once if it died."""
+        already_recovered = self._ensure_healthy_context()
+        try:
+            return self._context.new_page()
+        except Exception as first_error:
+            if not is_closed_context_error(first_error):
+                raise
+            if already_recovered:
+                log.error("browser context recovery failed after one retry")
+                self._cleanup_session_state()
+                raise BrowserSessionError(
+                    "browser context recovery failed after one retry"
+                ) from first_error
+            log.warning(
+                "browser context closed unexpectedly; restarting persistent "
+                "session (1/1)"
+            )
+            self._cleanup_session_state()
+            try:
+                self._launch_context()
+                return self._context.new_page()
+            except Exception as recovery_error:
+                log.error("browser context recovery failed after one retry")
+                if is_closed_context_error(recovery_error):
+                    self._cleanup_session_state()
+                raise BrowserSessionError(
+                    "browser context recovery failed after one retry"
+                ) from recovery_error
+
+    def cookies(self, urls=None) -> list[dict]:
+        """Return context cookies without exposing the owned context object."""
+        self._ensure_healthy_context()
+        if urls is None:
+            return self._context.cookies()
+        return self._context.cookies(urls)
 
     # ------------------------------------------------------------- checks
 
