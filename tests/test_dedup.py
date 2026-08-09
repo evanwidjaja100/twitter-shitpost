@@ -140,7 +140,14 @@ class TestCmdOnce:
         alert.assert_called_once()
 
     @pytest.mark.parametrize(
-        "reason", ["unverified", "timeout", "error", "captcha", "login"]
+        "reason", [
+            "unverified",
+            "timeout",
+            "error",
+            "captcha",
+            "login",
+            "post_button_disabled_timeout",
+        ]
     )
     def test_ambiguous_or_failed_publisher_never_records(self, tmp_path, reason):
         """Every non-positive publisher result must skip permanent dedup."""

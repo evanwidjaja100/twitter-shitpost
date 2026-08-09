@@ -33,6 +33,7 @@ class FakeLocator:
         self.selector = selector
         self.wait_for_calls = []
         self.click_calls = 0
+        self.click_timeouts = []
         self.typed_chunks = []
         self.input_files = None
         self._count = 0
@@ -68,10 +69,28 @@ class FakeLocator:
         return 1
 
     def inner_text(self, timeout=None):
+        if self.selector == COMPOSER:
+            return "".join(self.typed_chunks)
         return self._text
 
-    def click(self):
+    def input_value(self, timeout=None):
+        return "".join(self.typed_chunks)
+
+    def evaluate(self, expression):
+        return "div"
+
+    def is_visible(self):
+        return self.selector in self.page.visible_selectors
+
+    def is_enabled(self):
+        return True
+
+    def get_attribute(self, name):
+        return None
+
+    def click(self, timeout=None):
         self.click_calls += 1
+        self.click_timeouts.append(timeout)
         self.page.events.append(("click", self.selector))
 
     def press_sequentially(self, text, delay=None):
@@ -129,13 +148,15 @@ def test_timeout_s_is_forwarded_as_ms(publisher):
         COMPOSER: 60000 // len(COMPOSER_SELECTORS),
         FILE_INPUT: 60000,
         ATTACHMENTS: 60000,
-        POST_BTN: 60000,
     }
-    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
+    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS):
         calls = page._locators[selector].wait_for_calls
         assert calls, f"no wait_for recorded for {selector}"
         for call in calls:
             assert call["timeout"] == expected[selector], (selector, call)
+    post_timeout = page._locators[POST_BTN].wait_for_calls[0]["timeout"]
+    assert 0 < post_timeout <= 60000
+    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= post_timeout
 
 
 def test_short_timeout_maps_to_ms(publisher):
@@ -146,11 +167,13 @@ def test_short_timeout_maps_to_ms(publisher):
         COMPOSER: max(1, 1000 // len(COMPOSER_SELECTORS)),
         FILE_INPUT: 1000,
         ATTACHMENTS: 1000,
-        POST_BTN: 1000,
     }
-    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
+    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS):
         for call in page._locators[selector].wait_for_calls:
             assert call["timeout"] == expected[selector], (selector, call)
+    post_timeout = page._locators[POST_BTN].wait_for_calls[0]["timeout"]
+    assert 0 < post_timeout <= 1000
+    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= post_timeout
 
 
 def test_composer_is_clicked_before_typing(publisher):

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 log = logging.getLogger("publisher")
 
@@ -80,6 +81,17 @@ ERROR_PATTERNS = [
     re.compile(r"you are not permitted", re.I),
     re.compile(r"can.t (send|post|tweet)", re.I),
 ]
+MEDIA_ERROR_PATTERNS = (
+    ("upload_failed", re.compile(r"\b(?:media|photo|video|file) failed to upload\b", re.I)),
+    ("upload_failed", re.compile(r"\bupload failed\b", re.I)),
+    ("could_not_upload", re.compile(r"\b(?:media|photo|video file|video|file) could not be uploaded\b", re.I)),
+    ("video_processing_failed", re.compile(r"\bvideo could not be processed\b", re.I)),
+    ("media_processing_failed", re.compile(r"\bmedia processing failed\b", re.I)),
+    ("unsupported_media", re.compile(r"\bunsupported (?:media|video|image|file)\b", re.I)),
+    ("file_too_large", re.compile(r"\bfile (?:is )?too large\b", re.I)),
+)
+
+READINESS_POLL_MS = 250
 
 # Ordered, maintainable X compose selectors. The stable test ID is deliberately
 # tag-agnostic: X currently renders a contenteditable ``div`` but has rendered
@@ -308,6 +320,151 @@ class XSession:
         for chunk in [text[i : i + 3] for i in range(0, len(text), 3)]:
             composer.press_sequentially(chunk, delay=random.randint(30, 180))
 
+    @staticmethod
+    def _composer_has_text(composer) -> bool | None:
+        """Conservatively verify that a requested caption produced text.
+
+        ``False`` is returned only after a reliable, tag-appropriate read says
+        the composer is empty. Unsupported/changed DOM behavior returns
+        ``None`` so diagnostics improve without inventing a false failure.
+        """
+        try:
+            tag_name = str(
+                composer.evaluate("element => element.tagName.toLowerCase()")
+            ).lower()
+            if tag_name in ("input", "textarea"):
+                value = composer.input_value(timeout=1000)
+            else:
+                value = composer.inner_text(timeout=1000)
+            return bool((value or "").strip())
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            log.warning("could not verify composer text after typing", exc_info=True)
+            return None
+
+    @staticmethod
+    def _media_error(text: str, ignored_text: str = "") -> str | None:
+        """Return a stable media failure code for known visible X messages."""
+        normalized = " ".join((text or "").split()).casefold()
+        ignored = " ".join((ignored_text or "").split()).casefold()
+        if ignored:
+            normalized = normalized.replace(ignored, "")
+        for code, pattern in MEDIA_ERROR_PATTERNS:
+            if pattern.search(normalized):
+                return code
+        return None
+
+    @staticmethod
+    def _remaining_ms(deadline: float) -> int:
+        return max(0, int((deadline - time.monotonic()) * 1000))
+
+    @classmethod
+    def _readiness_diagnostics(
+        cls,
+        page,
+        post_btn,
+        attachment,
+        *,
+        composer_non_empty,
+        detected_problem=None,
+        media_error=None,
+    ) -> dict:
+        """Collect bounded, non-sensitive compose readiness state."""
+        diagnostics = {
+            "button_visible": None,
+            "button_enabled": None,
+            "aria_disabled": None,
+            "disabled_attribute": None,
+            "attachment_count": None,
+            "composer_non_empty": composer_non_empty,
+            "url": "<unavailable>",
+            "detected_problem": detected_problem,
+            "media_error": media_error,
+        }
+        checks = (
+            ("button_visible", lambda: post_btn.is_visible()),
+            ("button_enabled", lambda: post_btn.is_enabled()),
+            ("aria_disabled", lambda: post_btn.get_attribute("aria-disabled")),
+            ("disabled_attribute", lambda: post_btn.get_attribute("disabled")),
+            ("attachment_count", lambda: attachment.count()),
+            ("url", lambda: page.url),
+        )
+        for key, check in checks:
+            try:
+                diagnostics[key] = check()
+            except Exception:
+                diagnostics[key] = "error"
+        return diagnostics
+
+    @classmethod
+    def _wait_until_post_ready(
+        cls,
+        page,
+        post_btn,
+        attachment,
+        deadline: float,
+        *,
+        composer_non_empty,
+        caption_text="",
+    ) -> dict:
+        """Wait until the visible Post button is enabled within one deadline."""
+        last_state = {"visible": False, "enabled": False}
+        while True:
+            remaining_ms = cls._remaining_ms(deadline)
+            body_text = ""
+            try:
+                body_text = page.locator("body").inner_text(
+                    timeout=max(1, min(1000, remaining_ms or 1))
+                )
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
+                pass
+
+            if problem := cls.detect_problem(page, body_text):
+                return {"ready": False, "reason": problem, "remaining_ms": remaining_ms}
+            if media_error := cls._media_error(body_text, caption_text):
+                diagnostics = cls._readiness_diagnostics(
+                    page,
+                    post_btn,
+                    attachment,
+                    composer_non_empty=composer_non_empty,
+                    media_error=media_error,
+                )
+                log.warning("X media readiness failure: %r", diagnostics)
+                return {
+                    "ready": False,
+                    "reason": f"media_upload_error:{media_error}",
+                    "remaining_ms": remaining_ms,
+                }
+
+            try:
+                last_state["visible"] = bool(post_btn.is_visible())
+                last_state["enabled"] = bool(post_btn.is_enabled())
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
+                last_state = {"visible": False, "enabled": False}
+
+            remaining_ms = cls._remaining_ms(deadline)
+            if last_state["visible"] and last_state["enabled"] and remaining_ms > 0:
+                return {"ready": True, "reason": None, "remaining_ms": remaining_ms}
+            if remaining_ms <= 0:
+                diagnostics = cls._readiness_diagnostics(
+                    page,
+                    post_btn,
+                    attachment,
+                    composer_non_empty=composer_non_empty,
+                )
+                log.warning("X Post button readiness timed out: %r", diagnostics)
+                return {
+                    "ready": False,
+                    "reason": "post_button_disabled_timeout",
+                    "remaining_ms": 0,
+                }
+            page.wait_for_timeout(min(READINESS_POLL_MS, remaining_ms))
+
     @classmethod
     def _log_dom_failure(cls, page: Page, stage: str, selectors) -> None:
         """Best-effort, non-sensitive diagnostics for X DOM drift."""
@@ -412,7 +569,7 @@ class XSession:
             )
             file_input.set_input_files(media_paths)
 
-            self._first_matching_locator(
+            attachment = self._first_matching_locator(
                 page,
                 ATTACHMENT_SELECTORS,
                 state="visible",
@@ -424,24 +581,53 @@ class XSession:
             if caption:
                 composer.click()
                 self._type_humanized(composer, caption)
+                composer_non_empty = self._composer_has_text(composer)
+                if composer_non_empty is False:
+                    return {"ok": False, "reason": "caption_not_entered"}
+            else:
+                composer_non_empty = None
 
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
+            readiness_deadline = time.monotonic() + (timeout_ms / 1000.0)
             post_btn = self._first_matching_locator(
                 page,
                 POST_BUTTON_SELECTORS,
                 state="visible",
-                timeout_ms=timeout_ms,
+                timeout_ms=max(1, self._remaining_ms(readiness_deadline)),
                 failure_reason="post_button_not_found: X Post button was not visible",
                 stage="post_button",
             )
-            post_btn.click()
+            readiness = self._wait_until_post_ready(
+                page,
+                post_btn,
+                attachment,
+                readiness_deadline,
+                composer_non_empty=composer_non_empty,
+                caption_text=caption,
+            )
+            if not readiness["ready"]:
+                return {"ok": False, "reason": readiness["reason"]}
+            click_timeout_ms = self._remaining_ms(readiness_deadline)
+            if click_timeout_ms <= 0:
+                return {"ok": False, "reason": "post_button_disabled_timeout"}
+            try:
+                post_btn.click(timeout=click_timeout_ms)
+            except PlaywrightTimeoutError:
+                diagnostics = self._readiness_diagnostics(
+                    page,
+                    post_btn,
+                    attachment,
+                    composer_non_empty=composer_non_empty,
+                )
+                log.warning("X Post button click timed out: %r", diagnostics)
+                return {"ok": False, "reason": "post_button_click_timeout"}
 
             # Success must be positively confirmed. Navigations, login/captcha
             # redirects or a changed URL are NEVER treated as proof of posting.
-            deadline = time.time() + timeout_s
-            while time.time() < deadline:
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
+            while time.monotonic() < deadline:
                 # Login/captcha/error state is checked before interpreting any
                 # navigation so a redirect to those pages fails the post.
                 if problem := self.detect_problem(page):
