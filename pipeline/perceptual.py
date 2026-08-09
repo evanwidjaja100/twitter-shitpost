@@ -12,9 +12,9 @@ cheap, deterministic perceptual pass on top of exact hashing:
 * Videos — three frames sampled at deterministic fractions of the duration
   (re-encoding a video with identical frames yields the same 3 hashes).
 
-``is_near_duplicate`` compares a candidate fingerprint set to a set of known
-fingerprints; a video is a near-duplicate when a *majority* (>= ceil(n/2)) of
-its sampled frames match a known frame within the Hamming threshold.
+``is_near_duplicate`` compares a candidate fingerprint set to one historical
+media group. A video is a near-duplicate when a *majority* (>= ceil(n/2)) of
+its sampled frames can be matched one-to-one within the Hamming threshold.
 
 Determinism & ordering guarantees: nothing in this module uses ``random`` or
 wall-clock time, thresholds are module constants, and fingerprint tables are
@@ -73,7 +73,13 @@ def hamming(a: str, b: str) -> int:
     return bin(n).count("1")
 
 
-def _frames(path: str, ffmpeg: str, ffprobe: str, frame_count: int = 3) -> list[str]:
+def _frames(
+    path: str,
+    ffmpeg: str,
+    ffprobe: str,
+    work: Path,
+    frame_count: int = 3,
+) -> list[str]:
     """Extract ``frame_count`` deterministic frames from a video as PNG paths.
 
     Frame times are the fractions in ``FRAME_FRACTIONS`` of the total duration.
@@ -85,7 +91,6 @@ def _frames(path: str, ffmpeg: str, ffprobe: str, frame_count: int = 3) -> list[
     duration = video_duration(ffprobe, path)
     if duration <= 0:
         raise MediaError(f"cannot fingerprint {path}: zero duration")
-    work = Path(tempfile.mkdtemp(prefix=".dhash_"))
     outputs: list[str] = []
     steps = FRAME_FRACTIONS[:frame_count]
     for i, frac in enumerate(steps):
@@ -110,14 +115,21 @@ def _frames(path: str, ffmpeg: str, ffprobe: str, frame_count: int = 3) -> list[
 
 
 def video_fingerprints(path: str, ffmpeg: str, ffprobe: str, frame_count: int = 3) -> list[str]:
-    """Perceptual fingerprint of a video: one 64-bit dHash per sampled frame."""
-    fps = []
-    for frame in _frames(path, ffmpeg, ffprobe, frame_count=frame_count):
+    """Hash sampled frames and always remove this operation's exact work dir.
+
+    Cleanup errors are warnings: they must not replace a more useful ffmpeg or
+    image-decoding exception, nor discard fingerprints that were computed
+    successfully. Only the directory allocated by this invocation is removed.
+    """
+    work = Path(tempfile.mkdtemp(prefix=".dhash_"))
+    try:
+        frames = _frames(path, ffmpeg, ffprobe, work, frame_count=frame_count)
+        return [dhash(frame) for frame in frames]
+    finally:
         try:
-            fps.append(dhash(frame))
-        finally:
-            _unlink_safe(frame)
-    return fps
+            shutil.rmtree(work)
+        except OSError as exc:
+            log.warning("could not remove perceptual temp directory %s: %s", work, exc)
 
 
 def image_fingerprints(path: str) -> list[str]:
@@ -149,25 +161,30 @@ def medium_fingerprints(path: str, kind: str, ffmpeg: str | None, ffprobe: str |
 
 
 def is_near_duplicate(candidate: list[str], known: list[str], distance: int = PERCEPTUAL_DISTANCE) -> bool:
-    """Whether ``candidate`` fingerprint matches ``known`` within ``distance``.
+    """Match a candidate against one historical media group.
 
-    A video is near-duplicate only when a majority (more than half) of its
-    sampled frames each match at least one known frame — a single-frame match
-    never decides a video. Empty candidate (no fingerprint) is never a match.
+    Matching uses maximum one-to-one bipartite matching. This tolerates small
+    sample timing shifts while preventing one generic historical frame from
+    satisfying multiple candidate samples. Callers compare same-kind groups
+    separately, so evidence can never accumulate across historical media.
     """
-    if not candidate:
+    if not candidate or not known:
         return False
-    if not known:
+
+    matched_history: dict[int, int] = {}
+
+    def assign(candidate_index: int, visited: set[int]) -> bool:
+        for history_index, historical in enumerate(known):
+            if history_index in visited:
+                continue
+            if hamming(candidate[candidate_index], historical) > distance:
+                continue
+            visited.add(history_index)
+            previous = matched_history.get(history_index)
+            if previous is None or assign(previous, visited):
+                matched_history[history_index] = candidate_index
+                return True
         return False
-    hits = 0
-    for c in candidate:
-        if any(hamming(c, k) <= distance for k in known):
-            hits += 1
+
+    hits = sum(assign(index, set()) for index in range(len(candidate)))
     return hits * 2 >= len(candidate)
-
-
-def _unlink_safe(name: str) -> None:
-    try:
-        Path(name).unlink(missing_ok=True)
-    except OSError:
-        pass

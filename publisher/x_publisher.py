@@ -4,7 +4,6 @@ Uses a persistent Brave profile (no API keys, $0 cost). All x.com selectors live
 in this module so UI changes are fixed in one place.
 """
 
-import json
 import random
 import re
 import time
@@ -83,18 +82,24 @@ class PublishError(Exception):
     """Raised with a stable reason string (login|captcha|error|timeout)."""
 
 
-def load_config_paths() -> dict:
-    base = Path(__file__).resolve().parent.parent
-    cfg_path = base / "config.json"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"missing config.json (copy config.example.json)")
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+def load_config_paths(config_path=None) -> dict:
+    """Load paths only after the complete config passes central validation."""
+    from config_validation import load_validated_config
+
+    default_base = Path(__file__).resolve().parent.parent
+    cfg_path = (
+        Path(config_path)
+        if config_path is not None
+        else default_base / "config.json"
+    )
+    cfg = load_validated_config(cfg_path)
+    base = cfg_path.resolve().parent
     paths = dict(cfg.get("paths", {}))
     paths["_base"] = base
     return paths
 
 
-def _resolved(paths: dict, key: str) -> str:
+def resolve_config_path(paths: dict, key: str) -> str:
     val = paths.get(key, "")
     if not val:
         return ""
@@ -105,10 +110,14 @@ def _resolved(paths: dict, key: str) -> str:
     return str(p.resolve())
 
 
+# Backward-compatible private name used by older callers/tests.
+_resolved = resolve_config_path
+
+
 class XSession:
     def __init__(self, paths: dict):
-        self.profile_dir = _resolved(paths, "browser_profile")
-        self.brave = _resolved(paths, "brave")
+        self.profile_dir = resolve_config_path(paths, "browser_profile")
+        self.brave = resolve_config_path(paths, "brave")
         self._playwright = None
         self._context = None
 

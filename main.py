@@ -10,7 +10,6 @@ Commands:
 """
 
 import argparse
-import json
 import logging
 import logging.handlers
 import sys
@@ -43,23 +42,19 @@ def _is_stdout_handler(h) -> bool:
 
 
 def load_config() -> dict:
-    from config_validation import config_warnings, validate_config
+    from config_validation import (
+        ConfigurationError,
+        config_warnings,
+        configuration_error_lines,
+        load_validated_config,
+    )
 
     cfg_path = BASE / "config.json"
-    if not cfg_path.exists():
-        print("ERROR: config.json not found — copy config.example.json to config.json")
-        sys.exit(1)
     try:
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        print(f"ERROR: config.json is not valid JSON: {e}")
-        sys.exit(1)
-
-    problems = validate_config(cfg)
-    if problems:
-        print("Invalid configuration: (fix config.json and retry)")
-        for p in problems:
-            print(f"  - {p}")
+        cfg = load_validated_config(cfg_path)
+    except ConfigurationError as exc:
+        for line in configuration_error_lines(exc):
+            print(line)
         sys.exit(1)
 
     for warning in config_warnings(cfg):
@@ -282,14 +277,20 @@ def pick_item(cfg: dict, db, session=None) -> dict | None:
 
         ffmpeg_exe = str(BASE / cfg["paths"]["ffmpeg"]) if cfg.get("paths", {}).get("ffmpeg") else None
         ffprobe_exe = str(BASE / cfg["paths"]["ffprobe"]) if cfg.get("paths", {}).get("ffprobe") else None
+        media_kind = item.get("kind", "image")
         fps = perceptual.medium_fingerprints(
             media_path,
-            item.get("kind", "image"),
+            media_kind,
             ffmpeg_exe,
             ffprobe_exe,
         )
-        if fps and perceptual.is_near_duplicate(fps, db.fingerprint_candidates(cooldown)):
-            continue
+        if fps:
+            history = db.fingerprint_groups(media_kind, cooldown)
+            if any(
+                perceptual.is_near_duplicate(fps, group["fingerprints"])
+                for group in history
+            ):
+                continue
         item["_fingerprints"] = fps
 
         from pipeline.filters import pick_caption
@@ -316,7 +317,7 @@ def mark_item_published(db, item) -> None:
     in the same atomic write). Shared by every publishing path — manual and
     daemon — so they cannot diverge.
     """
-    db.finalize_successful_post(
+    finalize_args = dict(
         caption=item["_caption"],
         media_path=item["_media_path"],
         source=item["source"],
@@ -325,6 +326,9 @@ def mark_item_published(db, item) -> None:
         content_hash=item.get("_hash"),
         fingerprints=item.get("_fingerprints"),
     )
+    if item.get("_fingerprints") and item.get("kind") in ("image", "video"):
+        finalize_args["media_kind"] = item["kind"]
+    db.finalize_successful_post(**finalize_args)
 
 
 # ------------------------------------------------------------- commands
@@ -398,7 +402,8 @@ def cmd_stats(cfg, offline: bool):
     from tracker import get_follower_count, maybe_check_followers, write_csv
 
     db = _make_db(cfg)
-    handle = cfg["tracking"].get("own_handle", "average_pocka")
+    tracking = cfg.get("tracking", {})
+    handle = tracking.get("own_handle", "average_pocka")
     session = None
     if not offline:
         from publisher.x_publisher import XSession

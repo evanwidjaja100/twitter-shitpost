@@ -1,4 +1,4 @@
-"""Central, fail-fast validation of the bot's JSON configuration.
+"""Central, fail-fast loading and validation of the bot configuration.
 
 Every safety-sensitive setting is checked here ONCE, at load time, before any
 database is created, browser launched, network request made or post attempted.
@@ -28,6 +28,9 @@ Design choices:
   example: it is ignored by every code path and only warned about here.
 """
 
+import json
+from pathlib import Path
+
 _DEPRECATED_KEYS = {
     ("safety", "max_posts_per_attempt_cycle"):
         "no longer read: the daemon posts at most once per scheduled slot; "
@@ -46,10 +49,45 @@ _REQUIRED_PATH_KEYS = (
 
 _POSTING_STYLES = ("title", "pool", "both")
 
+# Maintained inventory of every nested value that production deliberately
+# hard-indexes. Optional values are consumed with ``.get`` defaults instead.
+# Tests remove every path in this tuple from the example configuration so a new
+# hard access cannot silently drift away from validation again.
+PRODUCTION_REQUIRED_PATHS = (
+    *(f"paths.{key}" for key in _REQUIRED_PATH_KEYS),
+    "posting.min_posts_per_day",
+    "posting.max_posts_per_day",
+    "posting.active_hours_start",
+    "posting.active_hours_end",
+    "posting.max_image_bytes",
+    "posting.max_video_bytes",
+    "posting.max_caption_len",
+    "posting.caption_style",
+    "posting.random_caption_chance",
+    "posting.caption_pool",
+    "safety.retry_backoff_minutes",
+    "safety.stop_on_login_failure",
+    "safety.max_daily_posts_absolute",
+    "filters.cooldown_days",
+    "filters.blocked_keywords",
+    "youtube.clip_min_seconds",
+    "youtube.clip_max_seconds",
+)
+
 _KNOWN_TOP_LEVEL = {
     "paths", "posting", "safety", "filters", "secrets",
     "x_sources", "tiktok", "youtube", "tracking", "retention", "sources",
 }
+
+PRODUCTION_REQUIRED_SECTIONS = (
+    "paths",
+    "posting",
+    "safety",
+    "filters",
+    "secrets",
+    "youtube",
+    "x_sources",
+)
 
 
 # ---------------------------------------------------------------- helpers
@@ -91,7 +129,11 @@ def _require_dict(cfg, key, errors):
 
 
 def _pos_int(errors, section, field, section_dict, minimum=1):
+    if field not in section_dict:
+        return None
     value = section_dict.get(field)
+    if value is None:
+        return None
     v = _as_int(value, None)
     if v is None:
         _add(errors, section, field, "must be an integer")
@@ -103,7 +145,11 @@ def _pos_int(errors, section, field, section_dict, minimum=1):
 
 
 def _number(errors, section, field, section_dict, minimum=0):
+    if field not in section_dict:
+        return None
     value = section_dict.get(field)
+    if value is None:
+        return None
     if not _is_number(value):
         _add(errors, section, field, "must be a number")
         return None
@@ -141,6 +187,17 @@ def _scraper_common(errors, name, section):
     _account_list(errors, name, "accounts", section.get("accounts"))
 
 
+def _require_production_fields(cfg, errors):
+    """Reject a missing/null hard-indexed leaf with one actionable error."""
+    for path in PRODUCTION_REQUIRED_PATHS:
+        section, field = path.split(".", 1)
+        holder = cfg.get(section)
+        if isinstance(holder, dict) and (
+            field not in holder or holder[field] is None
+        ):
+            _add(errors, section, field, "is required")
+
+
 # --------------------------------------------------------------- validator
 
 
@@ -150,13 +207,15 @@ def validate_config(cfg: dict) -> list[str]:
     if not isinstance(cfg, dict):
         return [f"configuration root must be an object, got {type(cfg).__name__}"]
 
+    _require_production_fields(cfg, errors)
+
     # ------------------------------------------------------------- paths
     paths = _require_dict(cfg, "paths", errors)
     if paths is not None:
         for key in _REQUIRED_PATH_KEYS:
             value = paths.get(key)
             if value is None:
-                _add(errors, "paths", key, "is required")
+                continue
             elif not isinstance(value, str) or not value.strip():
                 _add(errors, "paths", key, "must be a non-empty string path")
 
@@ -170,6 +229,8 @@ def validate_config(cfg: dict) -> list[str]:
                  "must be <= posting.max_posts_per_day")
 
         for field in ("active_hours_start", "active_hours_end"):
+            if posting.get(field) is None:
+                continue
             h = _as_int(posting.get(field), None)
             if h is None:
                 _add(errors, "posting", field, "must be an integer hour 0-23")
@@ -181,7 +242,7 @@ def validate_config(cfg: dict) -> list[str]:
             _pos_int(errors, "posting", field, posting, minimum=1)
 
         cap = _as_int(posting.get("max_caption_len"), None)
-        if cap is None or cap < 1:
+        if posting.get("max_caption_len") is not None and (cap is None or cap < 1):
             _add(errors, "posting", "max_caption_len", "must be a positive integer")
 
         style = posting.get("caption_style")
@@ -296,6 +357,44 @@ def validate_config(cfg: dict) -> list[str]:
             _number(errors, "retention", "interval_hours", retention, minimum=1)
 
     return errors
+
+
+class ConfigurationError(Exception):
+    """A config file could not be read, parsed, or validated."""
+
+    def __init__(self, kind: str, problems: list[str]):
+        self.kind = kind
+        self.problems = list(problems)
+        super().__init__("; ".join(self.problems))
+
+
+def load_validated_config(config_path) -> dict:
+    """Read JSON and validate it through the one authoritative config path."""
+    path = Path(config_path)
+    if not path.exists():
+        raise ConfigurationError(
+            "missing", [f"{path.name} not found — copy config.example.json to config.json"]
+        )
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(
+            "json", [f"{path.name} is not valid JSON: {exc}"]
+        ) from exc
+    problems = validate_config(cfg)
+    if problems:
+        raise ConfigurationError("validation", problems)
+    return cfg
+
+
+def configuration_error_lines(exc: ConfigurationError) -> list[str]:
+    """Stable operator-facing formatting shared by both entrypoints."""
+    if exc.kind == "validation":
+        return [
+            "Invalid configuration: (fix config.json and retry)",
+            *(f"  - {problem}" for problem in exc.problems),
+        ]
+    return [f"ERROR: {problem}" for problem in exc.problems]
 
 
 def config_warnings(cfg) -> list:

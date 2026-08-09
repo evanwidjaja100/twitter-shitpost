@@ -13,6 +13,7 @@ Requirements proven here:
   * obsolete/unknown keys only warn, so old configs keep working.
 """
 
+import ast
 import json
 import sys
 from pathlib import Path
@@ -131,6 +132,74 @@ class TestExampleConfig:
         cfg["tiktok"]["accounts"] = []
         cfg["x_sources"]["accounts"] = []
         assert config_validation.validate_config(cfg) == []
+
+    @pytest.mark.parametrize("section", config_validation.PRODUCTION_REQUIRED_SECTIONS)
+    def test_every_required_section_is_rejected_when_missing(self, section):
+        cfg = _valid()
+        cfg.pop(section)
+        assert any(
+            section in error and "required" in error
+            for error in config_validation.validate_config(cfg)
+        )
+
+    @pytest.mark.parametrize("path", config_validation.PRODUCTION_REQUIRED_PATHS)
+    def test_every_maintained_required_leaf_is_rejected_when_missing(self, path):
+        cfg = _valid()
+        section, field = path.split(".", 1)
+        cfg[section].pop(field)
+        errors = config_validation.validate_config(cfg)
+        assert any(path in error and "required" in error for error in errors)
+
+    def test_tracking_is_optional_by_contract(self):
+        cfg = _valid()
+        cfg.pop("tracking")
+        assert config_validation.validate_config(cfg) == []
+
+    def test_optional_tracking_fields_use_defaults(self):
+        cfg = _valid()
+        cfg["tracking"] = {}
+        assert config_validation.validate_config(cfg) == []
+
+    def test_all_production_hard_leaf_accesses_are_in_required_schema(self):
+        """Static guard against adding cfg[section][field] without validation."""
+        roots = {
+            "cfg": None,
+            "paths": "paths",
+            "posting": "posting",
+            "safety": "safety",
+            "filters": "filters",
+            "tracking": "tracking",
+        }
+        found = set()
+        for path in BASE.rglob("*.py"):
+            if any(
+                part in {"tests", ".venv", "browser_profile", "__pycache__"}
+                for part in path.parts
+            ) or path.name == "config_validation.py":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Subscript):
+                    continue
+                keys = []
+                current = node
+                while isinstance(current, ast.Subscript):
+                    key = current.slice
+                    if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                        keys = []
+                        break
+                    keys.append(key.value)
+                    current = current.value
+                if not keys or not isinstance(current, ast.Name) or current.id not in roots:
+                    continue
+                keys.reverse()
+                prefix = roots[current.id]
+                if current.id == "cfg" and len(keys) >= 2:
+                    found.add(".".join(keys))
+                elif prefix and not keys[0].startswith("_"):
+                    found.add(f"{prefix}." + ".".join(keys))
+
+        assert found <= set(config_validation.PRODUCTION_REQUIRED_PATHS)
 
 
 class TestNumericLimits:
@@ -263,6 +332,18 @@ class TestTypes:
         errs = config_validation.validate_config(cfg)
         assert any("random_caption_chance" in e for e in errs)
 
+    @pytest.mark.parametrize(
+        ("path", "bad"),
+        (
+            ("posting.caption_pool", "hello"),
+            ("posting.random_caption_chance", "0.5"),
+            ("filters.blocked_keywords", "spam"),
+        ),
+    )
+    def test_required_caption_and_filter_wrong_types_are_actionable(self, path, bad):
+        cfg = _mutate(_valid(), path, bad)
+        assert any(path in error for error in config_validation.validate_config(cfg))
+
     def test_paths_missing(self):
         cfg = _valid()
         cfg["paths"].pop("db_file")
@@ -348,3 +429,16 @@ class TestFailsBeforeBrowserStartup:
             main.load_config()
         assert exc.value.code == 1
         assert "not valid JSON" in capsys.readouterr().out
+
+
+def test_stats_offline_accepts_absent_tracking(tmp_path, monkeypatch, capsys):
+    """The optional tracking section must not reappear as a stats KeyError."""
+    cfg = _valid()
+    cfg.pop("tracking")
+    cfg["paths"]["logs_dir"] = str(tmp_path / "logs")
+    fake_db = mock.MagicMock()
+    fake_db.follower_history.return_value = []
+    monkeypatch.setattr(main, "_make_db", lambda _cfg: fake_db)
+    with mock.patch("tracker.write_csv"):
+        main.cmd_stats(cfg, offline=True)
+    assert "No follower data" in capsys.readouterr().out

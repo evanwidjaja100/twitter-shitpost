@@ -16,6 +16,7 @@ from publisher.x_publisher import (
     BROWSER_EXTRA_ARGS,
     install_anti_detection,
     load_config_paths,
+    resolve_config_path,
 )
 
 
@@ -26,12 +27,23 @@ def write_marker(marker_path: str):
     )
 
 
-def main() -> int:
-    paths = load_config_paths()
-    base = Path(paths["_base"])
-    profile_dir = str((base / paths["browser_profile"]).resolve())
-    brave = paths.get("brave")
-    marker = str(Path(paths["logs_dir"]) / "logged_in.json")
+def main(config_path=None) -> int:
+    from config_validation import ConfigurationError, configuration_error_lines
+
+    try:
+        paths = (
+            load_config_paths()
+            if config_path is None
+            else load_config_paths(config_path)
+        )
+    except ConfigurationError as exc:
+        for line in configuration_error_lines(exc):
+            print(line)
+        return 1
+
+    profile_dir = resolve_config_path(paths, "browser_profile")
+    brave = resolve_config_path(paths, "brave")
+    marker = str(Path(resolve_config_path(paths, "logs_dir")) / "logged_in.json")
 
     print("=" * 60)
     print("STEP 1: The bot's Brave window will open at x.com.")

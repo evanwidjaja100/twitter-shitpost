@@ -43,7 +43,7 @@ class Database:
         self._init_schema()
 
     def _init_schema(self):
-        with self._lock:
+        with self._lock, self._conn:
             cur = self._conn.cursor()
             cur.execute(
                 """
@@ -111,7 +111,48 @@ class Database:
                 )
                 """
             )
-            self._conn.commit()
+            # Legacy ``fingerprints`` rows above are intentionally retained but
+            # never used for grouped decisions: they contain no reliable media
+            # identity or kind, so fabricating video groups would be unsafe.
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_perceptual_groups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    media_kind TEXT NOT NULL CHECK (media_kind IN ('image', 'video')),
+                    content_hash TEXT,
+                    source TEXT,
+                    source_url TEXT,
+                    first_seen REAL NOT NULL,
+                    last_seen REAL NOT NULL,
+                    post_count INTEGER NOT NULL DEFAULT 1,
+                    last_post_id INTEGER
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_perceptual_group_hash_kind
+                ON media_perceptual_groups (media_kind, content_hash)
+                WHERE content_hash IS NOT NULL
+                """
+            )
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_perceptual_group_kind_seen
+                ON media_perceptual_groups (media_kind, last_seen)
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_perceptual_fingerprints (
+                    group_id INTEGER NOT NULL,
+                    sample_index INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    PRIMARY KEY (group_id, sample_index),
+                    FOREIGN KEY (group_id) REFERENCES media_perceptual_groups(id)
+                )
+                """
+            )
 
     def is_hash_seen(self, content_hash: str, cooldown_days: int, now_ts: float | None = None) -> bool:
         """Whether `content_hash` is within its repost cooldown.
@@ -168,32 +209,99 @@ class Database:
             )
             self._conn.commit()
 
-    def record_fingerprints(self, fingerprints, source: str, source_url: str, now_ts=None):
-        """Record fingerprint rows atomically (one commit).
+    @staticmethod
+    def _media_kind(media_kind: str) -> str:
+        if media_kind not in ("image", "video"):
+            raise ValueError("media_kind must be 'image' or 'video'")
+        return media_kind
 
-        A successful post's perceptual fingerprint set is recorded in a single
-        transaction so a partially recorded fingerprint can never be observed
-        by a subsequent read. Each fingerprint is upserted like a hash row with
-        ``last_seen``/``post_count`` bookkeeping for cooldown reads. ``now_ts``
-        is injectable for deterministic cooldown tests (defaults to real clock).
+    def _write_perceptual_group(
+        self,
+        fingerprints,
+        media_kind: str,
+        source: str,
+        source_url: str,
+        content_hash: str | None,
+        post_id: int | None,
+        now: float,
+    ) -> int | None:
+        """Insert/update one complete group; caller owns lock and transaction."""
+        if not fingerprints:
+            return None
+        kind = self._media_kind(media_kind)
+        group_id = None
+        if content_hash:
+            row = self._conn.execute(
+                """
+                SELECT id FROM media_perceptual_groups
+                WHERE media_kind = ? AND content_hash = ?
+                """,
+                (kind, content_hash),
+            ).fetchone()
+            if row is not None:
+                group_id = row["id"]
+                self._conn.execute(
+                    """
+                    UPDATE media_perceptual_groups
+                    SET source = ?, source_url = ?, last_seen = ?,
+                        post_count = post_count + 1,
+                        last_post_id = COALESCE(?, last_post_id)
+                    WHERE id = ?
+                    """,
+                    (source, source_url, now, post_id, group_id),
+                )
+                self._conn.execute(
+                    "DELETE FROM media_perceptual_fingerprints WHERE group_id = ?",
+                    (group_id,),
+                )
+        if group_id is None:
+            cur = self._conn.execute(
+                """
+                INSERT INTO media_perceptual_groups
+                    (media_kind, content_hash, source, source_url, first_seen,
+                     last_seen, post_count, last_post_id)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (kind, content_hash, source, source_url, now, now, post_id),
+            )
+            group_id = cur.lastrowid
+        for sample_index, fingerprint in enumerate(fingerprints):
+            self._conn.execute(
+                """
+                INSERT INTO media_perceptual_fingerprints
+                    (group_id, sample_index, fingerprint)
+                VALUES (?, ?, ?)
+                """,
+                (group_id, sample_index, fingerprint),
+            )
+        return group_id
+
+    def record_fingerprints(
+        self,
+        fingerprints,
+        source: str,
+        source_url: str,
+        now_ts=None,
+        media_kind: str = "image",
+        content_hash: str | None = None,
+    ):
+        """Record one typed perceptual group atomically.
+
+        This compatibility helper is useful for imports/tests. Production
+        success uses :meth:`finalize_successful_post` so post/source/hash/group
+        state commits together.
         """
         if not fingerprints:
-            return
+            return None
         now = time.time() if now_ts is None else float(now_ts)
         with self._lock:
             try:
-                for fp in fingerprints:
-                    self._conn.execute(
-                        """
-                        INSERT INTO fingerprints (fingerprint, source, source_url, first_seen, last_seen, post_count)
-                        VALUES (?, ?, ?, ?, ?, 1)
-                        ON CONFLICT(fingerprint) DO UPDATE SET
-                            last_seen = excluded.last_seen,
-                            post_count = post_count + 1
-                        """,
-                        (fp, source, source_url, now, now),
-                    )
+                group_id = self._write_perceptual_group(
+                    fingerprints, media_kind, source, source_url,
+                    content_hash, None, now,
+                )
                 self._conn.commit()
+                return group_id
             except Exception:
                 try:
                     self._conn.rollback()
@@ -201,16 +309,45 @@ class Database:
                     pass
                 raise
 
-    def fingerprint_candidates(self, cooldown_days: int, now_ts: float | None = None) -> list[str]:
-        """All fingerprint rows still within their repost cooldown."""
+    def fingerprint_groups(
+        self,
+        media_kind: str,
+        cooldown_days: int,
+        now_ts: float | None = None,
+    ) -> list[dict]:
+        """Recent same-kind history, preserving one media group per result."""
+        kind = self._media_kind(media_kind)
         now = time.time() if now_ts is None else float(now_ts)
         cutoff = now - cooldown_days * 86400
         with self._lock:
             rows = self._conn.execute(
-                "SELECT fingerprint FROM fingerprints WHERE last_seen >= ?",
-                (cutoff,),
+                """
+                SELECT g.id AS group_id, g.media_kind, g.content_hash,
+                       g.first_seen, g.last_seen, f.sample_index, f.fingerprint
+                FROM media_perceptual_groups AS g
+                JOIN media_perceptual_fingerprints AS f ON f.group_id = g.id
+                WHERE g.media_kind = ? AND g.last_seen >= ?
+                ORDER BY g.id, f.sample_index
+                """,
+                (kind, cutoff),
             ).fetchall()
-            return [r["fingerprint"] for r in rows]
+        groups = []
+        by_id = {}
+        for row in rows:
+            group = by_id.get(row["group_id"])
+            if group is None:
+                group = {
+                    "group_id": row["group_id"],
+                    "media_kind": row["media_kind"],
+                    "content_hash": row["content_hash"],
+                    "first_seen": row["first_seen"],
+                    "last_seen": row["last_seen"],
+                    "fingerprints": [],
+                }
+                by_id[row["group_id"]] = group
+                groups.append(group)
+            group["fingerprints"].append(row["fingerprint"])
+        return groups
 
     def record_successful_item(
         self,
@@ -262,6 +399,7 @@ class Database:
         source_url: str,
         content_hash: str | None,
         fingerprints=None,
+        media_kind: str | None = None,
         error: str | None = "posted",
         now_ts=None,
     ):
@@ -276,7 +414,7 @@ class Database:
         now = now_ts if now_ts is not None else time.time()
         with self._lock:
             try:
-                self._conn.execute(
+                post_cur = self._conn.execute(
                     """
                     INSERT INTO posts (posted_at, caption, media_path, source, source_url, hash, status, error)
                     VALUES (?, ?, ?, ?, ?, ?, 'posted', ?)
@@ -299,17 +437,11 @@ class Database:
                         (content_hash, source, source_url, now, now),
                     )
                 if fingerprints:
-                    for fp in fingerprints:
-                        self._conn.execute(
-                            """
-                            INSERT INTO fingerprints (fingerprint, source, source_url, first_seen, last_seen, post_count)
-                            VALUES (?, ?, ?, ?, ?, 1)
-                            ON CONFLICT(fingerprint) DO UPDATE SET
-                                last_seen = excluded.last_seen,
-                                post_count = post_count + 1
-                            """,
-                            (fp, source, source_url, now, now),
-                        )
+                    kind = media_kind or ("image" if len(fingerprints) == 1 else "video")
+                    self._write_perceptual_group(
+                        fingerprints, kind, source, source_url,
+                        content_hash, post_cur.lastrowid, now,
+                    )
                 self._conn.commit()
             except Exception:
                 try:

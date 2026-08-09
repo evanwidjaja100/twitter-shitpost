@@ -135,6 +135,160 @@ def test_video_fingerprints_raises_when_frame_extraction_fails(tmp_path):
             perceptual.video_fingerprints(str(src), "ffmpeg", "ffprobe")
 
 
+def _owned_temp_factory(parent):
+    real_mkdtemp = perceptual.tempfile.mkdtemp
+
+    def make(*args, **kwargs):
+        kwargs["dir"] = str(parent)
+        return real_mkdtemp(*args, **kwargs)
+
+    return make
+
+
+def test_video_fingerprint_success_cleans_owned_temp_directory(tmp_path):
+    frame = _gradient(tmp_path / "frame.png")
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp",
+        side_effect=_owned_temp_factory(temp_parent),
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch(
+        "pipeline.perceptual.subprocess.run",
+        _fake_ffmpeg_sequence([frame, frame, frame]),
+    ):
+        assert len(perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")) == 3
+    assert list(temp_parent.iterdir()) == []
+
+
+@pytest.mark.parametrize("fail_at", [1, 2])
+def test_video_fingerprint_extraction_failure_cleans_all_frames(tmp_path, fail_at):
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    calls = {"n": 0}
+
+    def run(cmd, *args, **kwargs):
+        calls["n"] += 1
+        output = Path(cmd[-1])
+        if calls["n"] == fail_at:
+            return SimpleNamespace(returncode=1, stderr="induced failure")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("L", (9, 8), 0).save(output)
+        return SimpleNamespace(returncode=0, stderr="")
+
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp",
+        side_effect=_owned_temp_factory(temp_parent),
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch("pipeline.perceptual.subprocess.run", side_effect=run):
+        with pytest.raises(Exception, match="induced failure"):
+            perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")
+    assert list(temp_parent.iterdir()) == []
+
+
+def test_video_fingerprint_decode_failure_cleans_temp_directory(tmp_path):
+    frame = _gradient(tmp_path / "frame.png")
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp",
+        side_effect=_owned_temp_factory(temp_parent),
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch(
+        "pipeline.perceptual.subprocess.run",
+        _fake_ffmpeg_sequence([frame, frame, frame]),
+    ), mock.patch("pipeline.perceptual.dhash", side_effect=OSError("decode boom")):
+        with pytest.raises(OSError, match="decode boom"):
+            perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")
+    assert list(temp_parent.iterdir()) == []
+
+
+def test_repeated_video_fingerprints_do_not_accumulate_temp_dirs(tmp_path):
+    frame = _gradient(tmp_path / "frame.png")
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp",
+        side_effect=_owned_temp_factory(temp_parent),
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch(
+        "pipeline.perceptual.subprocess.run",
+        _fake_ffmpeg_sequence([frame]),
+    ):
+        for _ in range(12):
+            perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")
+            assert list(temp_parent.iterdir()) == []
+
+
+def test_cleanup_failure_is_logged_without_replacing_fingerprint_result(
+    tmp_path, caplog
+):
+    frame = _gradient(tmp_path / "frame.png")
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    real_rmtree = perceptual.shutil.rmtree
+    real_mkdtemp = perceptual.tempfile.mkdtemp
+    owned = []
+
+    def make(*args, **kwargs):
+        kwargs["dir"] = str(temp_parent)
+        path = real_mkdtemp(*args, **kwargs)
+        owned.append(Path(path))
+        return path
+
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp", side_effect=make
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch(
+        "pipeline.perceptual.subprocess.run", _fake_ffmpeg_sequence([frame])
+    ), mock.patch(
+        "pipeline.perceptual.shutil.rmtree", side_effect=OSError("cleanup denied")
+    ):
+        result = perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")
+
+    assert len(result) == 3
+    assert "cleanup denied" in caplog.text
+    for path in owned:
+        real_rmtree(path)
+
+
+def test_cleanup_failure_does_not_replace_primary_fingerprint_error(tmp_path):
+    frame = _gradient(tmp_path / "frame.png")
+    temp_parent = tmp_path / "temps"
+    temp_parent.mkdir()
+    real_mkdtemp = perceptual.tempfile.mkdtemp
+    real_rmtree = perceptual.shutil.rmtree
+    owned = []
+
+    def make(*args, **kwargs):
+        kwargs["dir"] = str(temp_parent)
+        path = real_mkdtemp(*args, **kwargs)
+        owned.append(Path(path))
+        return path
+
+    with mock.patch(
+        "pipeline.perceptual.tempfile.mkdtemp", side_effect=make
+    ), mock.patch(
+        "pipeline.perceptual.video_duration", return_value=10.0
+    ), mock.patch(
+        "pipeline.perceptual.subprocess.run", _fake_ffmpeg_sequence([frame])
+    ), mock.patch(
+        "pipeline.perceptual.dhash", side_effect=RuntimeError("primary hash error")
+    ), mock.patch(
+        "pipeline.perceptual.shutil.rmtree", side_effect=OSError("cleanup denied")
+    ):
+        with pytest.raises(RuntimeError, match="primary hash error"):
+            perceptual.video_fingerprints("clip.mp4", "ffmpeg", "ffprobe")
+
+    for path in owned:
+        real_rmtree(path)
+
+
 # ------------------------------------------------------------- near-dup rule
 
 def test_is_near_duplicate_identical_image():
@@ -153,9 +307,14 @@ def test_is_near_duplicate_video_requires_majority():
     candidate = ["1111111111111111", "2222222222222222", "3333333333333333"]
     assert perceptual.is_near_duplicate(candidate, known) is False
 
-    # Two of three frames match -> majority reached.
+    # Reusing one historical frame cannot create a majority.
     candidate2 = ["1111111111111111", "2222222222222222", "1111111111111111"]
-    assert perceptual.is_near_duplicate(candidate2, known) is True
+    assert perceptual.is_near_duplicate(candidate2, known) is False
+
+    # Two distinct historical samples matching two candidate samples does.
+    assert perceptual.is_near_duplicate(candidate2, [
+        "1111111111111111", "1111111111111111",
+    ]) is True
 
 
 def test_is_near_duplicate_single_frame_image_matches_itself():
@@ -165,24 +324,23 @@ def test_is_near_duplicate_single_frame_image_matches_itself():
 
 # --------------------------------------------------------- DB fingerprint rows
 
-def test_record_fingerprints_upserts_and_counts(tmp_path):
+def test_record_fingerprints_preserves_separate_groups(tmp_path):
     db = Database(str(tmp_path / "bot.db"))
-    db.record_fingerprints(["aa", "bb"], "youtube", "u")
-    db.record_fingerprints(["aa"], "youtube", "u")
-    assert sorted(db.fingerprint_candidates(30)) == ["aa", "bb"]
-    row = db._conn.execute(
-        "SELECT post_count AS n FROM fingerprints WHERE fingerprint = 'aa'"
-    ).fetchone()
-    assert row["n"] == 2
+    db.record_fingerprints(["aa", "bb"], "youtube", "u", media_kind="video")
+    db.record_fingerprints(["aa"], "youtube", "u2", media_kind="video")
+    groups = db.fingerprint_groups("video", 30)
+    assert [g["fingerprints"] for g in groups] == [["aa", "bb"], ["aa"]]
 
 
-def test_fingerprint_candidates_respects_cooldown_cutoff(tmp_path):
+def test_fingerprint_groups_respect_cooldown_cutoff(tmp_path):
     db = Database(str(tmp_path / "bot.db"))
     now = 1_700_000_000.0
     db.record_fingerprints(["near"], "youtube", "u", now_ts=now)
     # A cooldown that still covers ``now + 3600`` keeps it; an expired one drops it.
-    assert "near" in db.fingerprint_candidates(cooldown_days=1, now_ts=now + 3600)
-    assert "near" not in db.fingerprint_candidates(cooldown_days=0, now_ts=now + 1)
+    recent = db.fingerprint_groups("image", cooldown_days=1, now_ts=now + 3600)
+    expired = db.fingerprint_groups("image", cooldown_days=0, now_ts=now + 1)
+    assert [group["fingerprints"] for group in recent] == [["near"]]
+    assert expired == []
 
 
 def test_finalize_successful_post_records_fingerprints_atomically(tmp_path):
@@ -191,10 +349,12 @@ def test_finalize_successful_post_records_fingerprints_atomically(tmp_path):
         caption="c", media_path="m.mp4", source="youtube", source_id="vid",
         source_url="https://youtu.be/v", content_hash="h",
         fingerprints=["frame1", "frame2"],
+        media_kind="video",
         now_ts=1_700_000_000.0,
     )
     fresh = Database(str(tmp_path / "bot.db"))
-    assert sorted(fresh.fingerprint_candidates(30, now_ts=1_700_000_001.0)) == ["frame1", "frame2"]
+    groups = fresh.fingerprint_groups("video", 30, now_ts=1_700_000_001.0)
+    assert [group["fingerprints"] for group in groups] == [["frame1", "frame2"]]
 
 
 def test_finalize_failure_rolls_back_fingerprints_too(tmp_path):
@@ -223,10 +383,11 @@ def test_finalize_failure_rolls_back_fingerprints_too(tmp_path):
             caption="c", media_path="m", source="youtube", source_id="vid",
             source_url="https://youtu.be/v", content_hash="h",
             fingerprints=["f1"],
+            media_kind="image",
             now_ts=1_700_000_000.0,
         )
     fresh = Database(str(tmp_path / "bot.db"))
-    assert fresh.fingerprint_candidates(30, now_ts=1_700_000_001.0) == []
+    assert fresh.fingerprint_groups("image", 30, now_ts=1_700_000_001.0) == []
 
 
 # ------------------------------------------------------ pick_item integration
@@ -300,7 +461,7 @@ def test_pick_item_allows_fresh_nondup_fingerprint(tmp_path):
     assert picked is not None
     assert picked["source_id"] == "vid-9"
     # Fingerprint is computed but nothing is recorded at pick time.
-    assert db.fingerprint_candidates(30) == []
+    assert db.fingerprint_groups("image", 30) == []
 
 
 def test_pick_item_not_blocked_when_fingerprint_unavailable(tmp_path):
@@ -319,6 +480,7 @@ def test_mark_item_published_passes_fingerprints_to_finalize():
     db = mock.MagicMock()
     item = {
         "source": "yt", "source_id": "1", "source_url": "https://youtu.be/1",
+        "kind": "video",
         "_caption": "c", "_media_path": "m.mp4", "_hash": "h",
         "_fingerprints": ["fp-1", "fp-2"],
     }
@@ -327,4 +489,5 @@ def test_mark_item_published_passes_fingerprints_to_finalize():
         caption="c", media_path="m.mp4", source="yt", source_id="1",
         source_url="https://youtu.be/1", content_hash="h",
         fingerprints=["fp-1", "fp-2"],
+        media_kind="video",
     )
