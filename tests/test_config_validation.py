@@ -51,6 +51,10 @@ def _valid() -> dict:
             "random_caption_chance": 0.15,
             "caption_pool": ["gg ez", "rate the build 1-10"],
         },
+        "publisher": {
+            "image_ready_timeout_seconds": 60,
+            "video_ready_timeout_seconds": 180,
+        },
         "safety": {
             "retry_backoff_minutes": 30,
             "stop_on_login_failure": True,
@@ -375,6 +379,55 @@ class TestMultipleErrors:
 
 
 class TestBackwardCompatibility:
+    def test_missing_publisher_section_uses_safe_defaults(self):
+        cfg = _valid()
+        cfg.pop("publisher")
+        assert config_validation.validate_config(cfg) == []
+        assert config_validation.publisher_ready_timeout_seconds(cfg, "image") == 60
+        assert config_validation.publisher_ready_timeout_seconds(cfg, "video") == 180
+
+    def test_missing_individual_timeout_uses_its_default(self):
+        cfg = _valid()
+        cfg["publisher"].pop("video_ready_timeout_seconds")
+        assert config_validation.validate_config(cfg) == []
+        assert config_validation.publisher_ready_timeout_seconds(cfg, "video") == 180
+
+    def test_custom_media_readiness_timeouts_are_selected(self):
+        cfg = _valid()
+        cfg["publisher"] = {
+            "image_ready_timeout_seconds": 15,
+            "video_ready_timeout_seconds": 240,
+        }
+        assert config_validation.validate_config(cfg) == []
+        assert config_validation.publisher_ready_timeout_seconds(cfg, "image") == 15
+        assert config_validation.publisher_ready_timeout_seconds(cfg, "video") == 240
+
+    @pytest.mark.parametrize(
+        ("field", "bad", "message"),
+        (
+            ("video_ready_timeout_seconds", 0, ">= 1"),
+            ("video_ready_timeout_seconds", -10, ">= 1"),
+            ("video_ready_timeout_seconds", "180", "integer"),
+            ("image_ready_timeout_seconds", None, "integer"),
+        ),
+    )
+    def test_invalid_media_readiness_timeout_is_rejected(self, field, bad, message):
+        cfg = _valid()
+        cfg["publisher"][field] = bad
+        errors = config_validation.validate_config(cfg)
+        assert any(
+            f"publisher.{field}" in error and message in error
+            for error in errors
+        )
+
+    def test_publisher_section_must_be_an_object(self):
+        cfg = _valid()
+        cfg["publisher"] = "slow"
+        assert any(
+            "publisher.(section)" in error and "object" in error
+            for error in config_validation.validate_config(cfg)
+        )
+
     def test_obsolete_attempt_cycle_only_warns(self):
         cfg = _valid()
         cfg["safety"] = dict(cfg["safety"])

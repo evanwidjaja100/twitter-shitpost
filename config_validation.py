@@ -23,6 +23,8 @@ Design choices:
   dependent and covered by ``main --selftest``. Enforcing it here would make
   every command - including offline ``--dry-run --seed-demo`` - fail when ffmpeg
   is missing even though no media work needs it.
+* The optional ``publisher`` section has backward-compatible readiness
+  defaults, so existing valid configs do not require migration.
 * Unknown/obsolete keys are warned about (not errors) so old configs keep
   working. The obsolete ``safety.max_posts_per_attempt_cycle`` is the canonical
   example: it is ignored by every code path and only warned about here.
@@ -48,6 +50,9 @@ _REQUIRED_PATH_KEYS = (
 )
 
 _POSTING_STYLES = ("title", "pool", "both")
+
+DEFAULT_IMAGE_READY_TIMEOUT_SECONDS = 60
+DEFAULT_VIDEO_READY_TIMEOUT_SECONDS = 180
 
 # Maintained inventory of every nested value that production deliberately
 # hard-indexes. Optional values are consumed with ``.get`` defaults instead.
@@ -76,7 +81,8 @@ PRODUCTION_REQUIRED_PATHS = (
 
 _KNOWN_TOP_LEVEL = {
     "paths", "posting", "safety", "filters", "secrets",
-    "x_sources", "tiktok", "youtube", "tracking", "retention", "sources",
+    "x_sources", "tiktok", "youtube", "tracking", "retention", "publisher",
+    "sources",
 }
 
 PRODUCTION_REQUIRED_SECTIONS = (
@@ -187,6 +193,29 @@ def _scraper_common(errors, name, section):
     _account_list(errors, name, "accounts", section.get("accounts"))
 
 
+def publisher_ready_timeout_seconds(cfg: dict, media_kind: str) -> int:
+    """Return the validated media-specific X readiness maximum.
+
+    The section and either field may be absent in an older config. Invalid
+    explicit values are rejected by :func:`validate_config`; this helper still
+    falls back defensively when called with an unvalidated mapping.
+    """
+    field = (
+        "video_ready_timeout_seconds"
+        if media_kind == "video"
+        else "image_ready_timeout_seconds"
+    )
+    default = (
+        DEFAULT_VIDEO_READY_TIMEOUT_SECONDS
+        if media_kind == "video"
+        else DEFAULT_IMAGE_READY_TIMEOUT_SECONDS
+    )
+    section = cfg.get("publisher", {})
+    if not isinstance(section, dict):
+        return default
+    return _as_int(section.get(field), default)
+
+
 def _require_production_fields(cfg, errors):
     """Reject a missing/null hard-indexed leaf with one actionable error."""
     for path in PRODUCTION_REQUIRED_PATHS:
@@ -257,6 +286,26 @@ def validate_config(cfg: dict) -> list[str]:
         pool = posting.get("caption_pool")
         if pool is not None and not _is_string_list(pool):
             _add(errors, "posting", "caption_pool", "must be a list of strings")
+
+    # ----------------------------------------------------------- publisher
+    publisher = cfg.get("publisher")
+    if publisher is not None:
+        if not isinstance(publisher, dict):
+            _add(errors, "publisher", "(section)",
+                 f"must be an object, got {type(publisher).__name__}")
+        else:
+            for field in (
+                "image_ready_timeout_seconds",
+                "video_ready_timeout_seconds",
+            ):
+                if field not in publisher:
+                    continue
+                value = publisher[field]
+                parsed = _as_int(value, None)
+                if parsed is None:
+                    _add(errors, "publisher", field, "must be an integer")
+                elif parsed < 1:
+                    _add(errors, "publisher", field, "must be >= 1")
 
     # ------------------------------------------------------------- safety
     safety = _require_dict(cfg, "safety", errors)

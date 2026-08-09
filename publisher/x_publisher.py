@@ -367,6 +367,9 @@ class XSession:
         attachment,
         *,
         composer_non_empty,
+        media_kind,
+        configured_timeout_seconds,
+        readiness_started_at,
         detected_problem=None,
         media_error=None,
     ) -> dict:
@@ -378,6 +381,11 @@ class XSession:
             "disabled_attribute": None,
             "attachment_count": None,
             "composer_non_empty": composer_non_empty,
+            "media_kind": media_kind,
+            "configured_ready_timeout_seconds": configured_timeout_seconds,
+            "elapsed_seconds": round(
+                max(0.0, time.monotonic() - readiness_started_at), 1
+            ),
             "url": "<unavailable>",
             "detected_problem": detected_problem,
             "media_error": media_error,
@@ -407,9 +415,15 @@ class XSession:
         *,
         composer_non_empty,
         caption_text="",
+        media_kind="image",
+        configured_timeout_seconds=60,
+        readiness_started_at=None,
     ) -> dict:
         """Wait until the visible Post button is enabled within one deadline."""
+        if readiness_started_at is None:
+            readiness_started_at = time.monotonic()
         last_state = {"visible": False, "enabled": False}
+        announced_video_wait = False
         while True:
             remaining_ms = cls._remaining_ms(deadline)
             body_text = ""
@@ -430,12 +444,38 @@ class XSession:
                     post_btn,
                     attachment,
                     composer_non_empty=composer_non_empty,
+                    media_kind=media_kind,
+                    configured_timeout_seconds=configured_timeout_seconds,
+                    readiness_started_at=readiness_started_at,
                     media_error=media_error,
                 )
                 log.warning("X media readiness failure: %r", diagnostics)
                 return {
                     "ready": False,
                     "reason": f"media_upload_error:{media_error}",
+                    "remaining_ms": remaining_ms,
+                }
+
+            try:
+                attachment_count = attachment.count()
+            except Exception as exc:
+                if is_closed_context_error(exc):
+                    raise
+                attachment_count = None
+            if attachment_count == 0:
+                diagnostics = cls._readiness_diagnostics(
+                    page,
+                    post_btn,
+                    attachment,
+                    composer_non_empty=composer_non_empty,
+                    media_kind=media_kind,
+                    configured_timeout_seconds=configured_timeout_seconds,
+                    readiness_started_at=readiness_started_at,
+                )
+                log.warning("X attachment disappeared during readiness: %r", diagnostics)
+                return {
+                    "ready": False,
+                    "reason": "attachment_missing_during_readiness",
                     "remaining_ms": remaining_ms,
                 }
 
@@ -449,13 +489,25 @@ class XSession:
 
             remaining_ms = cls._remaining_ms(deadline)
             if last_state["visible"] and last_state["enabled"] and remaining_ms > 0:
+                if announced_video_wait:
+                    elapsed = max(0.0, time.monotonic() - readiness_started_at)
+                    log.info("X video Post button enabled after %.1fs", elapsed)
                 return {"ready": True, "reason": None, "remaining_ms": remaining_ms}
+            if media_kind == "video" and not announced_video_wait:
+                log.info(
+                    "X video attached; waiting up to %.0fs for Post button readiness",
+                    configured_timeout_seconds,
+                )
+                announced_video_wait = True
             if remaining_ms <= 0:
                 diagnostics = cls._readiness_diagnostics(
                     page,
                     post_btn,
                     attachment,
                     composer_non_empty=composer_non_empty,
+                    media_kind=media_kind,
+                    configured_timeout_seconds=configured_timeout_seconds,
+                    readiness_started_at=readiness_started_at,
                 )
                 log.warning("X Post button readiness timed out: %r", diagnostics)
                 return {
@@ -534,9 +586,28 @@ class XSession:
 
     # ------------------------------------------------------------- posting
 
-    def post(self, caption: str, media_paths: list[str], timeout_s: int = 60) -> dict:
-        """Post one tweet with attached media. Returns {"ok": bool, "reason": str}."""
+    def post(
+        self,
+        caption: str,
+        media_paths: list[str],
+        timeout_s: int = 60,
+        *,
+        media_kind: str = "image",
+        ready_timeout_s: int | float | None = None,
+    ) -> dict:
+        """Post one tweet with attached media.
+
+        ``media_kind`` describes the attached set; callers must use ``video``
+        when any attachment is a video. ``ready_timeout_s`` applies only to
+        Post-button readiness/actionability, not general DOM operations or the
+        separate positive-confirmation phase.
+        """
         timeout_ms = max(1, int(timeout_s * 1000))
+        if ready_timeout_s is None:
+            # Backward-compatible direct-call behavior. Production orchestration
+            # always supplies the centrally validated media-specific value.
+            ready_timeout_s = timeout_s
+        ready_timeout_ms = max(1, int(ready_timeout_s * 1000))
         for p in media_paths:
             if not Path(p).exists():
                 return {"ok": False, "reason": f"missing media file {p}"}
@@ -590,14 +661,17 @@ class XSession:
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
-            readiness_deadline = time.monotonic() + (timeout_ms / 1000.0)
             post_btn = self._first_matching_locator(
                 page,
                 POST_BUTTON_SELECTORS,
-                state="visible",
-                timeout_ms=max(1, self._remaining_ms(readiness_deadline)),
-                failure_reason="post_button_not_found: X Post button was not visible",
+                state="attached",
+                timeout_ms=timeout_ms,
+                failure_reason="post_button_not_found: X Post button was not attached",
                 stage="post_button",
+            )
+            readiness_started_at = time.monotonic()
+            readiness_deadline = (
+                readiness_started_at + (ready_timeout_ms / 1000.0)
             )
             readiness = self._wait_until_post_ready(
                 page,
@@ -606,6 +680,9 @@ class XSession:
                 readiness_deadline,
                 composer_non_empty=composer_non_empty,
                 caption_text=caption,
+                media_kind=media_kind,
+                configured_timeout_seconds=ready_timeout_ms / 1000.0,
+                readiness_started_at=readiness_started_at,
             )
             if not readiness["ready"]:
                 return {"ok": False, "reason": readiness["reason"]}
@@ -620,6 +697,9 @@ class XSession:
                     post_btn,
                     attachment,
                     composer_non_empty=composer_non_empty,
+                    media_kind=media_kind,
+                    configured_timeout_seconds=ready_timeout_ms / 1000.0,
+                    readiness_started_at=readiness_started_at,
                 )
                 log.warning("X Post button click timed out: %r", diagnostics)
                 return {"ok": False, "reason": "post_button_click_timeout"}

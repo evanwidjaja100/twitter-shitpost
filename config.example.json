@@ -27,6 +27,10 @@
       "this aged well"
     ]
   },
+  "publisher": {
+    "image_ready_timeout_seconds": 60,
+    "video_ready_timeout_seconds": 180
+  },
   "tiktok": {
     "foryou": true,
     "accounts": [],

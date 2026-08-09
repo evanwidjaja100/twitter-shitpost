@@ -114,11 +114,14 @@ class FakeLocator:
         if self.selector != POST_BTN:
             return True
         self.page.post_readiness_polls += 1
-        enabled_after = self.page.post_enabled_after_polls
-        enabled = (
-            enabled_after is not None
-            and self.page.post_readiness_polls >= enabled_after
-        )
+        if self.page.post_enabled_after_seconds is not None:
+            enabled = self.page.elapsed_seconds >= self.page.post_enabled_after_seconds
+        else:
+            enabled_after = self.page.post_enabled_after_polls
+            enabled = (
+                enabled_after is not None
+                and self.page.post_readiness_polls >= enabled_after
+            )
         self.page.last_post_enabled = enabled
         return enabled
 
@@ -153,7 +156,10 @@ class FakePage:
                  present_selectors=None, visible_selectors=None,
                  post_enabled_after_polls=1, composer_tag="div",
                  media_error_after_waits=None, force_empty_composer=False,
-                 post_click_error=None):
+                 post_click_error=None, post_enabled_after_seconds=None,
+                 media_error_after_seconds=None,
+                 attachment_disappears_after_seconds=None,
+                 captcha_after_seconds=None):
         self.url = url
         self.body_text = body_text
         self.login_link_count = 0
@@ -163,12 +169,19 @@ class FakePage:
         self.after_post_login_link = after_post_login_link
         self.clock = clock or _FakeClock()
         self.post_enabled_after_polls = post_enabled_after_polls
+        self.post_enabled_after_seconds = post_enabled_after_seconds
         self.post_readiness_polls = 0
         self.last_post_enabled = post_enabled_after_polls == 0
         self.composer_tag = composer_tag
         self.media_error_after_waits = media_error_after_waits
         self.force_empty_composer = force_empty_composer
         self.post_click_error = post_click_error
+        self.media_error_after_seconds = media_error_after_seconds
+        self.attachment_disappears_after_seconds = (
+            attachment_disappears_after_seconds
+        )
+        self.captcha_after_seconds = captcha_after_seconds
+        self._clock_started_at = self.clock.time()
         self.waits = []
         self._locators = {}
         defaults = {COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN, BODY}
@@ -204,6 +217,26 @@ class FakePage:
             and len(self.waits) >= self.media_error_after_waits
         ):
             self.body_text = "Video could not be processed"
+        if (
+            self.media_error_after_seconds is not None
+            and self.elapsed_seconds >= self.media_error_after_seconds
+        ):
+            self.body_text = "Video could not be processed"
+        if (
+            self.attachment_disappears_after_seconds is not None
+            and self.elapsed_seconds >= self.attachment_disappears_after_seconds
+        ):
+            self.present_selectors.discard(ATTACHMENTS)
+            self.visible_selectors.discard(ATTACHMENTS)
+        if (
+            self.captcha_after_seconds is not None
+            and self.elapsed_seconds >= self.captcha_after_seconds
+        ):
+            self.body_text = "Verify your identity — you are not a bot"
+
+    @property
+    def elapsed_seconds(self):
+        return self.clock.time() - self._clock_started_at
 
     def title(self):
         return "Compose / X"
@@ -219,11 +252,24 @@ def media(tmp_path):
     return str(p)
 
 
-def _post(page, media_path, timeout_s=60):
+def _post(
+    page,
+    media_path,
+    timeout_s=60,
+    *,
+    media_kind="image",
+    ready_timeout_s=None,
+):
     session = XSession({"browser_profile": "bp", "brave": "brave"})
     session.new_page = lambda: page
     with mock.patch("publisher.x_publisher.time.monotonic", page.clock.time):
-        return session.post("hello world", [media_path], timeout_s=timeout_s)
+        return session.post(
+            "hello world",
+            [media_path],
+            timeout_s=timeout_s,
+            media_kind=media_kind,
+            ready_timeout_s=ready_timeout_s,
+        )
 
 
 def test_confirmed_success_returns_ok(media):
@@ -492,3 +538,151 @@ def test_enabled_button_click_timeout_has_stable_failure(media):
     button = page.locator(POST_BTN)
     assert button.click_calls == 1
     assert 0 < button.click_timeouts[0] <= 1000
+
+
+def test_video_can_remain_disabled_past_60_seconds_then_post(media, caplog):
+    caplog.set_level("INFO", logger="publisher")
+    page = FakePage(
+        sent_toast=True,
+        post_enabled_after_seconds=91,
+    )
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {"ok": True, "reason": "posted"}
+    assert page.elapsed_seconds == pytest.approx(91)
+    assert page.locator(POST_BTN).click_calls == 1
+    assert "waiting up to 180s" in caplog.text
+    assert "enabled after 91.0s" in caplog.text
+
+
+def test_video_uses_its_full_configured_timeout_without_clicking(media, caplog):
+    page = FakePage(post_enabled_after_polls=None)
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {"ok": False, "reason": "post_button_disabled_timeout"}
+    assert page.elapsed_seconds == pytest.approx(180)
+    assert page.locator(POST_BTN).click_calls == 0
+    assert "'media_kind': 'video'" in caplog.text
+    assert "'configured_ready_timeout_seconds': 180.0" in caplog.text
+    assert "'elapsed_seconds': 180.0" in caplog.text
+
+
+def test_image_uses_short_configured_timeout(media):
+    page = FakePage(post_enabled_after_polls=None)
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="image",
+        ready_timeout_s=15,
+    )
+
+    assert res["reason"] == "post_button_disabled_timeout"
+    assert page.elapsed_seconds == pytest.approx(15)
+    assert page.locator(POST_BTN).click_calls == 0
+
+
+def test_video_enabled_after_two_seconds_does_not_wait_to_maximum(media):
+    page = FakePage(sent_toast=True, post_enabled_after_seconds=2)
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {"ok": True, "reason": "posted"}
+    assert page.elapsed_seconds == pytest.approx(2)
+    assert page.locator(POST_BTN).click_calls == 1
+
+
+def test_video_media_error_at_30_seconds_stops_early(media):
+    page = FakePage(
+        post_enabled_after_polls=None,
+        media_error_after_seconds=30,
+    )
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res["reason"] == "media_upload_error:video_processing_failed"
+    assert page.elapsed_seconds == pytest.approx(30)
+    assert page.locator(POST_BTN).click_calls == 0
+
+
+def test_attachment_disappearance_stops_readiness_early(media):
+    page = FakePage(
+        post_enabled_after_polls=None,
+        attachment_disappears_after_seconds=3,
+    )
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {
+        "ok": False,
+        "reason": "attachment_missing_during_readiness",
+    }
+    assert page.elapsed_seconds == pytest.approx(3)
+    assert page.locator(POST_BTN).click_calls == 0
+
+
+def test_captcha_during_video_processing_stops_early(media):
+    page = FakePage(
+        post_enabled_after_polls=None,
+        captcha_after_seconds=4,
+    )
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {"ok": False, "reason": "captcha"}
+    assert page.elapsed_seconds == pytest.approx(4)
+    assert page.locator(POST_BTN).click_calls == 0
+
+
+def test_video_readiness_still_requires_positive_confirmation(media):
+    page = FakePage(post_enabled_after_seconds=2)
+
+    res = _post(
+        page,
+        media,
+        timeout_s=1,
+        media_kind="video",
+        ready_timeout_s=180,
+    )
+
+    assert res == {"ok": False, "reason": "timeout"}
+    assert page.locator(POST_BTN).click_calls == 1

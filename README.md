@@ -47,6 +47,8 @@ add accounts (no key needed).
 - `youtube.channels` — optional list of `{name, handle: "@channel"}` to pull clips from (needs `youtube_api_key`)
 - `x_sources.accounts` — X accounts to scrape (e.g. `["@memelord", ...]`)
 - `posting.min/max_posts_per_day` — daily volume (default 3-6)
+- `publisher.image_ready_timeout_seconds` — maximum wait for an attached image post to become submit-ready (default 60 seconds)
+- `publisher.video_ready_timeout_seconds` — maximum wait for X to finish accepting/processing an attached video before Post becomes enabled (default 180 seconds)
 - `filters.blocked_keywords` — content never posted
 - `filters.cooldown_days` — how long before a duplicate may appear again
   (both exact MD5 hashes and perceptual video/image fingerprints)

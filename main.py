@@ -372,6 +372,19 @@ def mark_item_published(db, item) -> None:
     db.finalize_successful_post(**finalize_args)
 
 
+def post_selected_item(session, item: dict, cfg: dict) -> dict:
+    """Publish one selected item with its validated media readiness budget."""
+    from config_validation import publisher_ready_timeout_seconds
+
+    media_kind = item.get("kind", "image")
+    return session.post(
+        item["_caption"],
+        [item["_media_path"]],
+        media_kind=media_kind,
+        ready_timeout_s=publisher_ready_timeout_seconds(cfg, media_kind),
+    )
+
+
 # ------------------------------------------------------------- commands
 
 # Last disk-maintenance timestamp (module-local: the daemon is single-process
@@ -425,7 +438,7 @@ def cmd_once(cfg):
                 if item is None:
                     alert(cfg, "no item available to post")
                     return
-                res = session.post(item["_caption"], [item["_media_path"]])
+                res = post_selected_item(session, item, cfg)
                 if res["ok"]:
                     mark_item_published(db, item)
                     logging.getLogger("post").info("POSTED: %s | %s", item["source_url"], item["_caption"])
@@ -519,7 +532,7 @@ def attempt_slot(cfg, db, session, now=None, rng=None) -> dict:
         logging.getLogger("daemon").info("no item found; skipping slot")
         return {"outcome": "no_item", "state": state}
 
-    res = session.post(item["_caption"], [item["_media_path"]])
+    res = post_selected_item(session, item, cfg)
     if res["ok"]:
         mark_item_published(db, item)
         logging.getLogger("daemon").info("POSTED: %s", item["source_url"])

@@ -118,6 +118,24 @@ class TestCmdOnce:
         assert not db.is_hash_seen("deadbeef1234", 30)
         alert.assert_called_once()
 
+    def test_readiness_timeout_does_not_write_any_success_dedup(self, tmp_path):
+        item = _item(kind="video", _fingerprints=["frame-a", "frame-b"])
+        db, session, alert = self._run(
+            tmp_path,
+            item=item,
+            pick=item,
+            session_result={
+                "ok": False,
+                "reason": "post_button_disabled_timeout",
+            },
+        )
+
+        assert session.post.call_count == 1
+        assert not db.is_source_seen("youtube", "vid-1")
+        assert not db.is_hash_seen("deadbeef1234", 30)
+        assert db.fingerprint_groups("video", 30) == []
+        alert.assert_called_once()
+
     def test_exception_records_nothing(self, tmp_path):
         db = Database(str(tmp_path / "bot.db"))
         session = mock.MagicMock()
