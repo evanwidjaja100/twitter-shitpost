@@ -49,6 +49,7 @@ add accounts (no key needed).
 - `posting.min/max_posts_per_day` — daily volume (default 3-6)
 - `filters.blocked_keywords` — content never posted
 - `filters.cooldown_days` — how long before a duplicate may appear again
+  (both exact MD5 hashes and perceptual video/image fingerprints)
 
 ## Commands
 
@@ -99,7 +100,7 @@ Starts the daemon at logon with no console window. Manual start:
 ```
 assets/            downloaded + processed media
 browser_profile/   the bot's isolated Brave profile (contains the login session)
-data/bot.db        SQLite: dedup hashes, post history
+data/bot.db        SQLite: dedup hashes + perceptual fingerprints, post history
 logs/bot.log       activity log
 logs/alerts.log    serious issues (post failures, login/captcha problems)
 tools/ffmpeg/      ffmpeg + ffprobe (local, no PATH needed)

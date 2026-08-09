@@ -5,16 +5,23 @@ Two modes, driven by config (they are ADDITIVE — both run when enabled):
   * Account mode  — visit curated @handles' profile grids (niche content).
 
 Both return the same item schema; main.py downloads each video downstream via
-yt-dlp. All selectors live here so they're a single point of maintenance.
+yt-dlp. All selectors live in one module-level map so a TikTok DOM change is
+fixed in one place.
 
 Metadata correctness: every feed video's like count, description and URL are
 read from the SAME card/container element, never from page-global ``.first``
-selectors, so candidates in one feed cannot exchange metadata.
+selectors, so candidates in one feed can never exchange metadata. A card that
+is missing any part yields an empty value for that part (it never borrows
+another card's).
 
 Duplicate videos: observations of the same video id (feed vs accounts, or a
 repeated card) are merged via ``_merge_tiktok_candidate`` — the best valid like
 count and the most complete caption win, regardless of discovery order, and
 each video is emitted exactly once.
+
+Resilience: an empty feed is a legitimate outcome; a page that exposes *none*
+of the known card containers is diagnosed with a warning so selector drift is
+visible instead of silent.
 """
 
 import logging
@@ -22,7 +29,29 @@ import random
 import re
 import time
 
+from scrapers._dom import first_matching_locator, iter_matching_nodes
+
 log = logging.getLogger("tiktok")
+
+# Ordered, conservative selectors. The first card selector is the current
+# production one; later entries are safe alternatives. Everything is scoped:
+# ``first_matching_locator`` returns the first selector that matches and
+# remains bound to the supplied scope (a card), never broadcasting to the page.
+TIKTOK_SELECTORS = {
+    "card": [
+        '[data-e2e="feed-item"]',
+        '[data-e2e="video-card"]',
+    ],
+    "video_link": [
+        'a[href*="/video/"]',
+    ],
+    "like_count": [
+        '[data-e2e="like-count"]',
+    ],
+    "description": [
+        '[data-e2e="video-card-desc"], [data-e2e="video-desc"]',
+    ],
+}
 
 _VIDEO_LINK_RE = re.compile(r"/(?:@[^/]+/)?video/(\d+)")
 
@@ -30,10 +59,9 @@ _VIDEO_LINK_RE = re.compile(r"/(?:@[^/]+/)?video/(\d+)")
 # scroll generously and stop once we've collected enough unique videos.
 _FEED_SCROLL_MULTIPLIER = 3
 
-# A logical feed card: the container that owns one video link + its own
-# like-count + description together. Kept as the single scoping selector so
-# per-video metadata never leaks across cards.
-_CARD = '[data-e2e="feed-item"], [data-e2e="video-card"]'
+
+def _empty_stats():
+    return {"cards_seen": 0, "parsed": 0, "incomplete": 0}
 
 
 def _parse_count(text) -> int:
@@ -96,38 +124,54 @@ def _merge_tiktok_candidate(existing: dict | None, incoming: dict) -> dict:
     }
 
 
-def _extract_feed_card(card) -> dict | None:
+def _extract_feed_card(card, stats: dict | None = None) -> dict | None:
     """Extract one logical feed/source entry STRICTLY from its own card element.
 
     The video link, like count and description are all read from the SAME card
     locator, so two videos in one feed can never exchange metadata. A card
     missing any part yields an empty value for that part (it never borrows
-    another card's).
+    another card's). Returns None only for a card with no video link at all
+    (i.e. not actually a video card).
     """
+    success = stats is not None and stats.get("cards_seen") is not None
+    if success:
+        stats["cards_seen"] += 1
     try:
-        a = card.locator('a[href*="/video/"]').first
-        href = a.get_attribute("href") or "" if a.count() else ""
+        link_loc = first_matching_locator(card, TIKTOK_SELECTORS["video_link"])
+        href = link_loc.get_attribute("href") or "" if link_loc is not None else ""
         if not _VIDEO_LINK_RE.search(href):
+            if success:
+                stats["incomplete"] += 1
             return None
 
         likes = 0
-        lik = card.locator('[data-e2e="like-count"]').first
-        if lik.count():
-            likes = _parse_count(lik.inner_text(timeout=1500))
+        lik_loc = first_matching_locator(card, TIKTOK_SELECTORS["like_count"])
+        if lik_loc is not None:
+            try:
+                likes = _parse_count(lik_loc.inner_text(timeout=1500))
+            except Exception:
+                likes = 0
 
         caption = ""
-        desc = card.locator('[data-e2e="video-card-desc"], [data-e2e="video-desc"]').first
-        if desc.count():
-            caption = desc.inner_text(timeout=1500).strip()[:200]
+        desc_loc = first_matching_locator(card, TIKTOK_SELECTORS["description"])
+        if desc_loc is not None:
+            try:
+                caption = (desc_loc.inner_text(timeout=1500) or "").strip()[:200]
+            except Exception:
+                caption = ""
 
+        if success:
+            stats["parsed"] += 1
         return _card(href, likes, caption)
     except Exception as e:
+        if success:
+            stats["incomplete"] += 1
         log.debug("tiktok feed card parse skipped: %s", e)
         return None
 
 
-def _collect_cards(page, limit: int) -> list[dict]:
-    """Return [{'id','href','likes','caption'}...] for visible video cards.
+def _collect_cards_with_stats(page, limit: int):
+    """Return ``(cards, stats)`` for the visible video cards.
 
     Every card is scoped: its link, like count and description are read from
     the SAME container, so metadata cannot attach to the wrong video. When the
@@ -135,38 +179,52 @@ def _collect_cards(page, limit: int) -> list[dict]:
     likes/caption win) instead of discarding the later record.
     """
     merged: dict[str, dict] = {}
-    for el in page.locator(_CARD).all():
-        card = _extract_feed_card(el)
+    stats = _empty_stats()
+    for el in iter_matching_nodes(page, TIKTOK_SELECTORS["card"]):
+        card = _extract_feed_card(el, stats)
         if card is None:
             continue
         merged[card["id"]] = _merge_tiktok_candidate(merged.get(card["id"]), card)
         if len(merged) >= limit:
             break
-    return list(merged.values())
+    return list(merged.values()), stats
 
 
-def _collect_feed(page, max_posts: int, scrolls: int) -> list[dict]:
-    """Scroll the For You feed, collecting per-card metadata for each video.
+def _collect_cards(page, limit: int) -> list[dict]:
+    """Backward-compatible wrapper: cards only (see _collect_cards_with_stats)."""
+    cards, _ = _collect_cards_with_stats(page, limit)
+    return cards
+
+
+def _collect_feed_with_stats(page, max_posts: int, scrolls: int):
+    """Scroll the For You feed; returns (cards, stats).
 
     Duplicate observations of the same video are merged (best likes/caption are
     kept) rather than dropping whichever record appeared second.
     """
     merged: dict[str, dict] = {}
+    stats = _empty_stats()
     probes = max(scrolls * _FEED_SCROLL_MULTIPLIER, 8)
     for _ in range(probes):
-        for el in page.locator(_CARD).all():
-            card = _extract_feed_card(el)
+        for el in iter_matching_nodes(page, TIKTOK_SELECTORS["card"]):
+            card = _extract_feed_card(el, stats)
             if card is None:
                 continue
             merged[card["id"]] = _merge_tiktok_candidate(merged.get(card["id"]), card)
             if len(merged) >= max_posts:
-                return list(merged.values())
+                return list(merged.values()), stats
         try:
             page.mouse.wheel(0, 3000)
         except Exception:
             pass
         page.wait_for_timeout(random.randint(1800, 2800))
-    return list(merged.values())
+    return list(merged.values()), stats
+
+
+def _collect_feed(page, max_posts: int, scrolls: int) -> list[dict]:
+    """Scroll the For You feed, collecting per-card metadata for each video."""
+    cards, _ = _collect_feed_with_stats(page, max_posts, scrolls)
+    return cards
 
 
 def _to_item(card: dict, handle: str, min_likes: int) -> dict | None:
@@ -194,6 +252,9 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     or in addition"): when ``foryou`` is enabled the general feed is collected
     AND every configured account is browsed; the final list is deduplicated by
     video id. Empty accounts + ``foryou=false`` falls back to the feed.
+
+    Diagnostics: one concise summary line per scrape plus a warning when the
+    page exposed none of the known card containers (possible selector drift).
     """
     accounts = [a for a in config.get("accounts", []) if a]
     foryou = bool(config.get("foryou", False))
@@ -201,6 +262,7 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
     max_posts = int(config.get("max_posts_per_account", 10))
     scrolls = int(config.get("scrolls", 3))
 
+    stats = _empty_stats()
     items: list[dict] = []
     collected: dict[str, dict] = {}
     handle_for: dict[str, str] = {}
@@ -214,7 +276,9 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
             except Exception as e:
                 log.warning("tiktok feed load failed: %s", e)
                 return items
-            for card in _collect_feed(page, max_posts, scrolls):
+            cards, feed_stats = _collect_feed_with_stats(page, max_posts, scrolls)
+            _merge_stats(stats, feed_stats)
+            for card in cards:
                 collected[card["id"]] = _merge_tiktok_candidate(
                     collected.get(card["id"]), card
                 )
@@ -237,7 +301,9 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                 log.warning("profile %s failed: %s", handle, e)
                 continue
 
-            for card in _collect_cards(page, max_posts):
+            cards, acct_stats = _collect_cards_with_stats(page, max_posts)
+            _merge_stats(stats, acct_stats)
+            for card in cards:
                 prev = collected.get(card["id"])
                 merged = _merge_tiktok_candidate(prev, card)
                 collected[card["id"]] = merged
@@ -255,4 +321,21 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
         item = _to_item(card, handle_for.get(card["id"], ""), min_likes)
         if item is not None:
             items.append(item)
+
+    log.info(
+        "TikTok: cards_seen=%d parsed=%d incomplete=%d candidates_after_min_likes=%d",
+        stats["cards_seen"], stats["parsed"], stats["incomplete"], len(items),
+    )
+    if (foryou or not accounts) and stats["cards_seen"] == 0:
+        log.warning(
+            "TikTok scrape found no video cards via known selectors "
+            "(%s) — possible structure/selector drift; no candidates emitted",
+            ", ".join(TIKTOK_SELECTORS["card"]),
+        )
     return items
+
+
+def _merge_stats(total: dict, extra: dict):
+    for key in ("cards_seen", "parsed", "incomplete"):
+        total[key] += extra.get(key, 0)
+    return total

@@ -73,7 +73,6 @@
     "youtube_api_key": ""
   },
   "safety": {
-    "max_posts_per_attempt_cycle": 1,
     "retry_backoff_minutes": 30,
     "stop_on_login_failure": true,
     "max_daily_posts_absolute": 10,

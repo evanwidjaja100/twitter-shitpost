@@ -99,6 +99,18 @@ class Database:
                 )
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fingerprints (
+                    fingerprint TEXT PRIMARY KEY,
+                    source TEXT,
+                    source_url TEXT,
+                    first_seen REAL,
+                    last_seen REAL,
+                    post_count INTEGER DEFAULT 0
+                )
+                """
+            )
             self._conn.commit()
 
     def is_hash_seen(self, content_hash: str, cooldown_days: int, now_ts: float | None = None) -> bool:
@@ -156,6 +168,50 @@ class Database:
             )
             self._conn.commit()
 
+    def record_fingerprints(self, fingerprints, source: str, source_url: str, now_ts=None):
+        """Record fingerprint rows atomically (one commit).
+
+        A successful post's perceptual fingerprint set is recorded in a single
+        transaction so a partially recorded fingerprint can never be observed
+        by a subsequent read. Each fingerprint is upserted like a hash row with
+        ``last_seen``/``post_count`` bookkeeping for cooldown reads. ``now_ts``
+        is injectable for deterministic cooldown tests (defaults to real clock).
+        """
+        if not fingerprints:
+            return
+        now = time.time() if now_ts is None else float(now_ts)
+        with self._lock:
+            try:
+                for fp in fingerprints:
+                    self._conn.execute(
+                        """
+                        INSERT INTO fingerprints (fingerprint, source, source_url, first_seen, last_seen, post_count)
+                        VALUES (?, ?, ?, ?, ?, 1)
+                        ON CONFLICT(fingerprint) DO UPDATE SET
+                            last_seen = excluded.last_seen,
+                            post_count = post_count + 1
+                        """,
+                        (fp, source, source_url, now, now),
+                    )
+                self._conn.commit()
+            except Exception:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                raise
+
+    def fingerprint_candidates(self, cooldown_days: int, now_ts: float | None = None) -> list[str]:
+        """All fingerprint rows still within their repost cooldown."""
+        now = time.time() if now_ts is None else float(now_ts)
+        cutoff = now - cooldown_days * 86400
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT fingerprint FROM fingerprints WHERE last_seen >= ?",
+                (cutoff,),
+            ).fetchall()
+            return [r["fingerprint"] for r in rows]
+
     def record_successful_item(
         self,
         source: str,
@@ -205,14 +261,16 @@ class Database:
         source_id: str,
         source_url: str,
         content_hash: str | None,
+        fingerprints=None,
         error: str | None = "posted",
         now_ts=None,
     ):
         """Record a confirmed successful post in one transaction.
 
         Writes the posts history row (status='posted'), the source dedup and
-        the media-hash dedup together so post history, dedup state and the
-        scheduler's per-window success count (derived from the posts table)
+        the media-hash dedup (plus the perceptual fingerprint rows, when
+        ``fingerprints`` is provided) together so post history, dedup state and
+        the scheduler's per-window success count (derived from the posts table)
         can never disagree. Any exception rolls the whole transaction back.
         """
         now = now_ts if now_ts is not None else time.time()
@@ -240,6 +298,18 @@ class Database:
                         """,
                         (content_hash, source, source_url, now, now),
                     )
+                if fingerprints:
+                    for fp in fingerprints:
+                        self._conn.execute(
+                            """
+                            INSERT INTO fingerprints (fingerprint, source, source_url, first_seen, last_seen, post_count)
+                            VALUES (?, ?, ?, ?, ?, 1)
+                            ON CONFLICT(fingerprint) DO UPDATE SET
+                                last_seen = excluded.last_seen,
+                                post_count = post_count + 1
+                            """,
+                            (fp, source, source_url, now, now),
+                        )
                 self._conn.commit()
             except Exception:
                 try:

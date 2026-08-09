@@ -43,11 +43,28 @@ def _is_stdout_handler(h) -> bool:
 
 
 def load_config() -> dict:
+    from config_validation import config_warnings, validate_config
+
     cfg_path = BASE / "config.json"
     if not cfg_path.exists():
         print("ERROR: config.json not found — copy config.example.json to config.json")
         sys.exit(1)
-    return json.loads(cfg_path.read_text(encoding="utf-8"))
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"ERROR: config.json is not valid JSON: {e}")
+        sys.exit(1)
+
+    problems = validate_config(cfg)
+    if problems:
+        print("Invalid configuration: (fix config.json and retry)")
+        for p in problems:
+            print(f"  - {p}")
+        sys.exit(1)
+
+    for warning in config_warnings(cfg):
+        print(f"WARNING: {warning}")
+    return cfg
 
 
 def setup_logging(cfg: dict):
@@ -261,6 +278,20 @@ def pick_item(cfg: dict, db, session=None) -> dict | None:
         if db.is_hash_seen(h, cooldown):
             continue
 
+        from pipeline import perceptual
+
+        ffmpeg_exe = str(BASE / cfg["paths"]["ffmpeg"]) if cfg.get("paths", {}).get("ffmpeg") else None
+        ffprobe_exe = str(BASE / cfg["paths"]["ffprobe"]) if cfg.get("paths", {}).get("ffprobe") else None
+        fps = perceptual.medium_fingerprints(
+            media_path,
+            item.get("kind", "image"),
+            ffmpeg_exe,
+            ffprobe_exe,
+        )
+        if fps and perceptual.is_near_duplicate(fps, db.fingerprint_candidates(cooldown)):
+            continue
+        item["_fingerprints"] = fps
+
         from pipeline.filters import pick_caption
 
         caption = pick_caption(
@@ -292,6 +323,7 @@ def mark_item_published(db, item) -> None:
         source_id=item["source_id"],
         source_url=item["source_url"],
         content_hash=item.get("_hash"),
+        fingerprints=item.get("_fingerprints"),
     )
 
 

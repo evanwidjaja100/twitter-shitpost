@@ -2,6 +2,16 @@
 
 Collects top recent posts (text + media) and downloads media via the shared
 session (cookies included). No official API reads = $0.
+
+Selector policy (scraper resilience): every selector lives in one module-level
+map so a Twitter DOM change is fixed in one place. Per-item reads are ALWAYS
+scoped to the tweet's own container element (never a page-global ``.first``),
+and the like-count threshold is authoritative: a missing or unparseable count
+is treated as 0 and can never slip through ``min_likes``.
+
+When the page structure disappears entirely (no tweet containers matched by any
+known selector) the scrape logs a diagnostics warning and returns no candidates
+instead of fabricating items.
 """
 
 import logging
@@ -10,7 +20,39 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from scrapers._dom import first_matching_locator, iter_matching_nodes
+
 log = logging.getLogger("x_scraper")
+
+# Ordered, known-safe selectors. The first key is the current production
+# selector; later entries are conservative fallbacks for DOM drift. Fallbacks
+# MUST stay scoped to the same element kind — broad selectors that could match
+# a different card are never used (correct failure beats wrong data).
+X_SELECTORS = {
+    # A tweet card: the scoping root (first_matching_locator uses the first
+    # selector that has matches; both stay tweet-shaped).
+    "article": [
+        'article[data-testid="tweet"]',
+        '[data-testid="tweet"]',
+    ],
+    "tweet_text": [
+        'div[data-testid="tweetText"]',
+    ],
+    "like_count": [
+        'button[data-testid="like"] span[data-testid="app-text-transition-container"]',
+    ],
+    "status_link": [
+        'a[href*="/status/"]',
+    ],
+    "media_img": [
+        'img[src*="pbs.twimg.com/media"]',
+    ],
+    "video": [
+        "video",
+    ],
+}
+
+_PBS_TWIMG = "pbs.twimg.com/media"
 
 
 def _parse_count(text: str) -> int:
@@ -27,14 +69,29 @@ def _parse_count(text: str) -> int:
         return 0
 
 
-def _post_media(page) -> list[str]:
-    """Collect media URLs from the current tweet article."""
+def _first_text(scope, selector_key: str, timeout_ms: int = 2000) -> str:
+    """Inner text of the first element under ``scope`` for a selector group.
+
+    Returns ``""`` when nothing matches or the read fails — the missing text
+    is never borrowed from another card or from page text.
+    """
+    loc = first_matching_locator(scope, X_SELECTORS[selector_key])
+    if loc is None:
+        return ""
+    try:
+        return (loc.inner_text(timeout=timeout_ms) or "")[:500]
+    except Exception:
+        return ""
+
+
+def _post_media(article) -> list[str]:
+    """Collect media URLs strictly from the current tweet article."""
     urls = []
-    for img in page.locator('img[src*="pbs.twimg.com/media"]').all():
+    for img in iter_matching_nodes(article, X_SELECTORS["media_img"]):
         src = img.get_attribute("src")
         if src and src not in urls:
             urls.append(src)
-    for v in page.locator("video").all():
+    for v in iter_matching_nodes(article, X_SELECTORS["video"]):
         src = v.get_attribute("src") or ""
         poster = v.get_attribute("poster") or ""
         if src.startswith("https://") and src not in urls:
@@ -44,11 +101,73 @@ def _post_media(page) -> list[str]:
     return urls
 
 
-def scrape(session, config: dict, assets_dir: str) -> list[dict]:
-    """Visit each account profile and collect candidate posts."""
+def _parse_article(article, min_likes: int) -> dict | None:
+    """Extract ONE tweet strictly from its own card.
+
+    Returns None when the like count is missing/unparseable/under the
+    threshold (conservative — it can never bypass ``min_likes``) or when no
+    status link is found. Missing media simply means a lower kind; a missing
+    caption stays empty. The method never queries the page globally.
+    """
+    likes = 0
+    like_loc = first_matching_locator(article, X_SELECTORS["like_count"])
+    if like_loc is not None:
+        try:
+            likes = _parse_count(like_loc.inner_text(timeout=2000))
+        except Exception:
+            likes = 0  # unparseable/missing = 0, never the threshold
+    if likes < min_likes:
+        return None
+
+    link = ""
+    link_loc = first_matching_locator(article, X_SELECTORS["status_link"])
+    if link_loc is not None:
+        try:
+            link = link_loc.get_attribute("href") or ""
+        except Exception:
+            link = ""
+    if not link:
+        return None
+
+    media_urls = _post_media(article)
+    kind = "image" if any(_PBS_TWIMG in u for u in media_urls) \
+        else ("video" if media_urls else "text")
+
+    return {
+        "source": "x",
+        "source_id": link.split("/status/")[-1].split("?")[0],
+        "source_url": f"https://x.com{link}" if link.startswith("/") else link,
+        "title": _first_text(article, "tweet_text"),
+        "media_url": media_urls[0] if media_urls else None,
+        "media_path": None,
+        "score": float(likes),
+        "created_utc": time.time(),
+        "nsfw": False,
+        "kind": kind,
+    }
+
+
+def _scrape_site(session, config: dict, assets_dir: str):
+    """Scrape all configured accounts; returns ``(items, stats)``.
+
+    ``stats`` records the observed counters used for diagnostics:
+      accounts, containers, parsed, parsed_incomplete, candidates,
+      selector_failures.
+    A zero-container page (with accounts configured) is diagnosed as likely
+    selector drift; a low parsed count after filtering is normal ``min_likes``.
+    """
+    stats = {
+        "accounts": 0,
+        "containers": 0,
+        "parsed": 0,
+        "incomplete": 0,
+        "candidates": 0,
+        "selector_failures": 0,
+    }
     accounts = config.get("accounts", [])
     if not accounts:
-        return []
+        return [], stats
+    stats["accounts"] = len(accounts)
     min_likes = config.get("min_likes", 5000)
     max_posts = config.get("max_posts_per_account", 10)
     scrolls = config.get("scrolls", 3)
@@ -69,54 +188,32 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
                 log.warning("profile %s failed: %s", handle, e)
                 continue
 
-            articles = page.locator('article[data-testid="tweet"]')
-            count = min(articles.count(), max_posts * 4)
+            articles = iter_matching_nodes(page, X_SELECTORS["article"])
+            stats["containers"] += len(articles)
+            if not articles:
+                log.warning(
+                    "X account @%s: page loaded but no tweet article containers "
+                    "matched known selectors (%s)",
+                    handle, ", ".join(X_SELECTORS["article"]),
+                )
+                stats["selector_failures"] += 1
+                continue
+
             collected = 0
-            for i in range(count):
+            for article in articles:
                 try:
-                    article = articles.nth(i)
-                    text = ""
-                    t = article.locator('div[data-testid="tweetText"]')
-                    if t.count():
-                        text = t.first.inner_text(timeout=2000)[:500]
-
-                    like_el = article.locator(
-                        'button[data-testid="like"] span[data-testid="app-text-transition-container"]'
-                    ).first
-                    likes = _parse_count(like_el.inner_text(timeout=2000)) if like_el.count() else 0
-
-                    link = ""
-                    a = article.locator('a[href*="/status/"]').first
-                    if a.count():
-                        link = a.get_attribute("href") or ""
-
-                    media_urls = _post_media(article)
-                    if likes < min_likes:
+                    parsed = _parse_article(article, min_likes)
+                    if parsed is None:
+                        stats["incomplete"] += 1
                         continue
-                    if not link:
+                    stats["parsed"] += 1
+                    if parsed["kind"] == "text" or not parsed["media_url"]:
                         continue
-
-                    kind = "image" if any(
-                        ".twimg.com/media" in u for u in media_urls
-                    ) else ("video" if media_urls else "text")
-
-                    item = {
-                        "source": "x",
-                        "source_id": link.split("/status/")[-1].split("?")[0],
-                        "source_url": f"https://x.com{link}" if link.startswith("/") else link,
-                        "title": text,
-                        "media_url": media_urls[0] if media_urls else None,
-                        "media_path": None,
-                        "score": float(likes),
-                        "created_utc": time.time(),
-                        "nsfw": False,
-                        "kind": kind,
-                    }
-                    if item["kind"] != "text" and item["media_url"]:
-                        items.append(item)
-                        collected += 1
-                        if collected >= max_posts:
-                            break
+                    items.append(parsed)
+                    stats["candidates"] += 1
+                    collected += 1
+                    if collected >= max_posts:
+                        break
                 except Exception as e:
                     log.debug("tweet parse skipped: %s", e)
                     continue
@@ -125,6 +222,28 @@ def scrape(session, config: dict, assets_dir: str) -> list[dict]:
             page.close()
         except Exception:
             pass
+    return items, stats
+
+
+def scrape(session, config: dict, assets_dir: str) -> list[dict]:
+    """Visit each account profile and collect candidate posts.
+
+    Diagnostics: one concise summary line per scrape plus a warning when a
+    loaded page exposes none of the expected tweet containers. An empty result
+    is a legitimate outcome when ``min_likes`` filters everything or no accounts
+    are configured; it is never treated as an exception.
+    """
+    items, stats = _scrape_site(session, config, assets_dir)
+    log.info(
+        "X: accounts=%d containers=%d parsed=%d candidates_after_min_likes=%d",
+        stats["accounts"], stats["containers"], stats["parsed"], stats["candidates"],
+    )
+    if stats["accounts"] and stats["containers"] == 0:
+        log.warning(
+            "X scrape found no tweet containers across %d accounts — possible "
+            "selector drift or bot-check page; no candidates emitted",
+            stats["accounts"],
+        )
     return items
 
 

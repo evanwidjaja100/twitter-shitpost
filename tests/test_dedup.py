@@ -164,6 +164,7 @@ class TestMarkItemPublished:
             source_id="vid-1",
             source_url="https://youtu.be/vid-1",
             content_hash="deadbeef1234",
+            fingerprints=None,
         )
 
     def test_calls_atomic_recorder_when_hash_missing(self):
@@ -178,6 +179,7 @@ class TestMarkItemPublished:
             source_id="vid-1",
             source_url="https://youtu.be/vid-1",
             content_hash=None,
+            fingerprints=None,
         )
 
 
