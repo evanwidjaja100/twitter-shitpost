@@ -4,12 +4,15 @@ Uses a persistent Brave profile (no API keys, $0 cost). All x.com selectors live
 in this module so UI changes are fixed in one place.
 """
 
+import logging
 import random
 import re
 import time
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
+
+log = logging.getLogger("publisher")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -77,9 +80,22 @@ ERROR_PATTERNS = [
     re.compile(r"can.t (send|post|tweet)", re.I),
 ]
 
+# Ordered, maintainable X compose selectors. The stable test ID is deliberately
+# tag-agnostic: X currently renders a contenteditable ``div`` but has rendered
+# a ``textarea`` in the past. Fallback textboxes are restricted to known compose
+# surfaces so search, messages, and unrelated page editors cannot be selected.
+COMPOSER_SELECTORS = (
+    '[data-testid="tweetTextarea_0"]',
+    '[role="dialog"] [role="textbox"][contenteditable="true"]',
+    '[data-testid="primaryColumn"] [role="textbox"][contenteditable="true"]',
+)
+FILE_INPUT_SELECTORS = ('[data-testid="fileInput"]',)
+ATTACHMENT_SELECTORS = ('[data-testid="attachments"]',)
+POST_BUTTON_SELECTORS = ('[data-testid="tweetButtonInline"]',)
+
 
 class PublishError(Exception):
-    """Raised with a stable reason string (login|captcha|error|timeout)."""
+    """Raised when a required compose control cannot be located safely."""
 
 
 def load_config_paths(config_path=None) -> dict:
@@ -175,6 +191,73 @@ class XSession:
         for chunk in [text[i : i + 3] for i in range(0, len(text), 3)]:
             composer.press_sequentially(chunk, delay=random.randint(30, 180))
 
+    @classmethod
+    def _log_dom_failure(cls, page: Page, stage: str, selectors) -> None:
+        """Best-effort, non-sensitive diagnostics for X DOM drift."""
+        try:
+            url = page.url
+        except Exception:
+            url = "<unavailable>"
+        try:
+            title = page.title()
+        except Exception:
+            title = "<unavailable>"
+        selector_counts = {}
+        for selector in selectors:
+            try:
+                selector_counts[selector] = page.locator(selector).count()
+            except Exception:
+                selector_counts[selector] = "error"
+        try:
+            detected_problem = cls.detect_problem(page)
+        except Exception:
+            detected_problem = None
+        log.warning(
+            "%s selector failure: url=%r title=%r detected_problem=%r "
+            "selector_counts=%r",
+            stage,
+            url,
+            title,
+            detected_problem,
+            selector_counts,
+        )
+
+    @classmethod
+    def _first_matching_locator(
+        cls,
+        page: Page,
+        selectors,
+        *,
+        state: str,
+        timeout_ms: int,
+        failure_reason: str,
+        stage: str,
+    ):
+        """Return the first ordered selector matching the requested state.
+
+        The total caller timeout is divided across selectors, keeping fallback
+        discovery bounded instead of multiplying the configured timeout by the
+        number of fallbacks. Visible lookups filter hidden duplicate nodes
+        before selecting ``first``.
+        """
+        selectors = tuple(selectors)
+        per_selector_timeout = max(1, timeout_ms // max(1, len(selectors)))
+        for selector in selectors:
+            locator = page.locator(selector)
+            if state == "visible":
+                locator = locator.filter(visible=True)
+            candidate = locator.first
+            try:
+                candidate.wait_for(
+                    state=state,
+                    timeout=per_selector_timeout,
+                )
+                return candidate
+            except Exception:
+                continue
+        cls._log_dom_failure(page, stage, selectors)
+        raise PublishError(failure_reason)
+
     # ------------------------------------------------------------- posting
 
     def post(self, caption: str, media_paths: list[str], timeout_s: int = 60) -> dict:
@@ -191,15 +274,34 @@ class XSession:
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
-            composer = page.locator('textarea[data-testid="tweetTextarea_0"]')
-            composer.wait_for(state="visible", timeout=timeout_ms)
+            composer = self._first_matching_locator(
+                page,
+                COMPOSER_SELECTORS,
+                state="visible",
+                timeout_ms=timeout_ms,
+                failure_reason=(
+                    "composer_not_found: known X composer selectors were not visible"
+                ),
+                stage="composer",
+            )
 
-            file_input = page.locator('input[data-testid="fileInput"]')
-            file_input.wait_for(state="attached", timeout=timeout_ms)
+            file_input = self._first_matching_locator(
+                page,
+                FILE_INPUT_SELECTORS,
+                state="attached",
+                timeout_ms=timeout_ms,
+                failure_reason="file_input_not_found: X media input was not attached",
+                stage="file_input",
+            )
             file_input.set_input_files(media_paths)
 
-            page.locator('div[data-testid="attachments"]').wait_for(
-                state="visible", timeout=timeout_ms
+            self._first_matching_locator(
+                page,
+                ATTACHMENT_SELECTORS,
+                state="visible",
+                timeout_ms=timeout_ms,
+                failure_reason="attachments_not_found: X media attachment was not visible",
+                stage="attachments",
             )
 
             if caption:
@@ -209,8 +311,14 @@ class XSession:
             if problem := self.detect_problem(page):
                 return {"ok": False, "reason": problem}
 
-            post_btn = page.locator('button[data-testid="tweetButtonInline"]')
-            post_btn.wait_for(state="visible", timeout=timeout_ms)
+            post_btn = self._first_matching_locator(
+                page,
+                POST_BUTTON_SELECTORS,
+                state="visible",
+                timeout_ms=timeout_ms,
+                failure_reason="post_button_not_found: X Post button was not visible",
+                stage="post_button",
+            )
             post_btn.click()
 
             # Success must be positively confirmed. Navigations, login/captcha
@@ -233,6 +341,8 @@ class XSession:
                 page.wait_for_timeout(1500)
             return {"ok": False, "reason": "timeout"}
 
+        except PublishError as e:
+            return {"ok": False, "reason": str(e)}
         except Exception as e:
             return {"ok": False, "reason": f"exception: {e}"}
         finally:

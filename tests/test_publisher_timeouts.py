@@ -10,12 +10,18 @@ from pathlib import Path
 
 import pytest
 
-from publisher.x_publisher import XSession
+from publisher.x_publisher import (
+    ATTACHMENT_SELECTORS,
+    COMPOSER_SELECTORS,
+    FILE_INPUT_SELECTORS,
+    POST_BUTTON_SELECTORS,
+    XSession,
+)
 
-COMPOSER = 'textarea[data-testid="tweetTextarea_0"]'
-FILE_INPUT = 'input[data-testid="fileInput"]'
-ATTACHMENTS = 'div[data-testid="attachments"]'
-POST_BTN = 'button[data-testid="tweetButtonInline"]'
+COMPOSER = COMPOSER_SELECTORS[0]
+FILE_INPUT = FILE_INPUT_SELECTORS[0]
+ATTACHMENTS = ATTACHMENT_SELECTORS[0]
+POST_BTN = POST_BUTTON_SELECTORS[0]
 SENT_TEXT = "text=Your post was sent"
 LOGIN_LINK = 'a[href="/login"]'
 BODY = "body"
@@ -31,15 +37,35 @@ class FakeLocator:
         self.input_files = None
         self._count = 0
         self._text = "x.com compose page"
+        self.visible_filter = False
 
     def wait_for(self, **kwargs):
         self.wait_for_calls.append(kwargs)
+        state = kwargs.get("state")
+        if state == "attached" and self.selector not in self.page.present_selectors:
+            raise TimeoutError(f"{self.selector} not attached")
+        if state == "visible" and self.selector not in self.page.visible_selectors:
+            raise TimeoutError(f"{self.selector} not visible")
+
+    def filter(self, *, visible=None, **kwargs):
+        self.visible_filter = bool(visible)
+        return self
+
+    @property
+    def first(self):
+        return self
 
     def set_input_files(self, paths):
         self.input_files = list(paths)
 
     def count(self):
-        return self._count
+        if self._count:
+            return self._count
+        if self.selector not in self.page.present_selectors:
+            return 0
+        if self.visible_filter and self.selector not in self.page.visible_selectors:
+            return 0
+        return 1
 
     def inner_text(self, timeout=None):
         return self._text
@@ -59,6 +85,10 @@ class FakePage:
         self._locators = {}
         self.url = "https://x.com/compose/post"
         self.waits = []
+        self.present_selectors = {
+            COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN, BODY,
+        }
+        self.visible_selectors = set(self.present_selectors)
 
     def goto(self, url, **kwargs):
         self.events.append(("goto", url))
@@ -73,6 +103,9 @@ class FakePage:
 
     def wait_for_timeout(self, ms):
         self.waits.append(ms)
+
+    def title(self):
+        return "Compose / X"
 
     def close(self):
         pass
@@ -92,20 +125,32 @@ def test_timeout_s_is_forwarded_as_ms(publisher):
     session, page, media = publisher
     res = session.post("hello world", [media], timeout_s=60)
     assert res["ok"] is True
+    expected = {
+        COMPOSER: 60000 // len(COMPOSER_SELECTORS),
+        FILE_INPUT: 60000,
+        ATTACHMENTS: 60000,
+        POST_BTN: 60000,
+    }
     for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
         calls = page._locators[selector].wait_for_calls
         assert calls, f"no wait_for recorded for {selector}"
         for call in calls:
-            assert call["timeout"] == 60000, (selector, call)
+            assert call["timeout"] == expected[selector], (selector, call)
 
 
 def test_short_timeout_maps_to_ms(publisher):
     session, page, media = publisher
     res = session.post("cap", [media], timeout_s=1)
     assert res["ok"] is True
+    expected = {
+        COMPOSER: max(1, 1000 // len(COMPOSER_SELECTORS)),
+        FILE_INPUT: 1000,
+        ATTACHMENTS: 1000,
+        POST_BTN: 1000,
+    }
     for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS, POST_BTN):
         for call in page._locators[selector].wait_for_calls:
-            assert call["timeout"] == 1000, (selector, call)
+            assert call["timeout"] == expected[selector], (selector, call)
 
 
 def test_composer_is_clicked_before_typing(publisher):
