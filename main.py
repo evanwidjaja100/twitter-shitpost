@@ -14,6 +14,7 @@ import logging
 import logging.handlers
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -571,6 +572,38 @@ class DaemonStop(Exception):
         self.reason = reason
 
 
+class NoSlotsNoticeState:
+    """Ephemeral transition state for the daemon's normal no-slot notice."""
+
+    def __init__(self):
+        self.window_key = None
+        self.no_slots = False
+
+    def observe_no_slots(self, logger, window_key: str) -> None:
+        first_for_state = not self.no_slots or self.window_key != window_key
+        log_method = logger.info if first_for_state else logger.debug
+        log_method("no remaining posting slots in the current window; waiting")
+        self.window_key = window_key
+        self.no_slots = True
+
+    def observe_available_slots(self) -> None:
+        self.window_key = None
+        self.no_slots = False
+
+
+def _logical_posting_window_key(posting: dict, now: datetime | None = None) -> str:
+    """Reuse scheduler semantics to identify the logical window for logging."""
+    import scheduler
+
+    now = now or datetime.now()
+    start = scheduler.window_start(
+        posting["active_hours_start"],
+        posting["active_hours_end"],
+        now,
+    )
+    return scheduler.window_id(start)
+
+
 def supervise_daemon(cfg):
     """Run the daemon, restarting it on unexpected recoverable exceptions.
 
@@ -639,6 +672,7 @@ def _run_daemon(cfg, on_success=None):
 
     db = _make_db(cfg)
     session = XSession(cfg["paths"])
+    session._daemon_no_slots_notice = NoSlotsNoticeState()
     log = logging.getLogger("daemon")
     try:
         session.start()
@@ -654,7 +688,7 @@ def _run_daemon(cfg, on_success=None):
             log.warning("error stopping daemon session (best effort)", exc_info=True)
 
 
-def _daemon_iteration(cfg, db, session):
+def _daemon_iteration(cfg, db, session, no_slots_notice=None):
     """One pass of the daemon main loop (followers + current posting window).
 
     Returns when the pass is complete without raising; raises
@@ -668,6 +702,11 @@ def _daemon_iteration(cfg, db, session):
     log = logging.getLogger("daemon")
     posting = cfg["posting"]
     safety = cfg["safety"]
+    if no_slots_notice is None:
+        no_slots_notice = getattr(session, "_daemon_no_slots_notice", None)
+        if not isinstance(no_slots_notice, NoSlotsNoticeState):
+            no_slots_notice = NoSlotsNoticeState()
+            session._daemon_no_slots_notice = no_slots_notice
 
     # Disk maintenance runs at a safe point (no media operation is active and
     # the publishing/browser locks are held) and is throttled to at most once
@@ -685,9 +724,12 @@ def _daemon_iteration(cfg, db, session):
         max_absolute=safety["max_daily_posts_absolute"],
     )
     if not times:
-        log.info("no remaining posting slots in the current window; waiting")
+        no_slots_notice.observe_no_slots(
+            log, _logical_posting_window_key(posting)
+        )
         time.sleep(60)
         return
+    no_slots_notice.observe_available_slots()
     for t in times:
         scheduler.sleep_until(t)
         # Fresh quota re-check before any pick/post: precomputed slots are
