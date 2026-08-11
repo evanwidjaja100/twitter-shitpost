@@ -49,6 +49,7 @@ add accounts (no key needed).
 - `posting.min/max_posts_per_day` — daily volume (default 3-6)
 - `publisher.image_ready_timeout_seconds` — maximum wait for an attached image post to become submit-ready (default 60 seconds)
 - `publisher.video_ready_timeout_seconds` — maximum wait for X to finish accepting/processing an attached video before Post becomes enabled (default 180 seconds)
+- `publisher.post_click_timeout_seconds` — bounded maximum for the physical Post-click actionability (default 15 seconds; independent of the media-readiness timeout; a click timeout is reconciled against the positive "Your post was sent" confirmation)
 - `filters.blocked_keywords` — content never posted
 - `filters.cooldown_days` — how long before a duplicate may appear again
   (both exact MD5 hashes and perceptual video/image fingerprints)

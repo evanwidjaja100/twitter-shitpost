@@ -15,6 +15,8 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from config_validation import DEFAULT_POST_CLICK_TIMEOUT_SECONDS
+
 log = logging.getLogger("publisher")
 
 USER_AGENT = (
@@ -94,6 +96,12 @@ MEDIA_ERROR_PATTERNS = (
 )
 
 READINESS_POLL_MS = 250
+
+# Physical Post-click action is bounded separately from media readiness. After a
+# click call times out the result is ambiguous (X may have received the click),
+# so reconciliation is allowed a short window to find the positive signal.
+POST_CLICK_RECONCILE_SECONDS = 5.0
+PLAYWRIGHT_ERROR_MAX_CHARS = 4000
 
 # Ordered, maintainable X compose selectors. The stable test ID is deliberately
 # tag-agnostic: X currently renders a contenteditable ``div`` but has rendered
@@ -193,6 +201,7 @@ class XSession:
     def __init__(self, paths: dict):
         self.profile_dir = resolve_config_path(paths, "browser_profile")
         self.brave = resolve_config_path(paths, "brave")
+        self.logs_dir = resolve_config_path(paths, "logs_dir")
         self._playwright = None
         self._context = None
         self._intentionally_stopped = False
@@ -968,6 +977,124 @@ class XSession:
             raise PublishError("ambiguous_post_button")
         return candidates.nth(0)
 
+    @staticmethod
+    def _has_positive_success(page) -> bool:
+        """The single authoritative X success signal.
+
+        No navigation, dialog disappearance or UI reset may replace it.
+        """
+        try:
+            return page.locator("text=Your post was sent").count() > 0
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return False
+
+    @staticmethod
+    def _pointer_hit_diagnostics(page, button) -> dict:
+        """Report which element receives pointer events at the button center.
+
+        The hit-tested node inside the button itself (a label span, icon, ...)
+        is not an intercepting overlay; ``inside_post_button`` distinguishes
+        that case from a genuine blocker above the button.
+        """
+        try:
+            box = button.bounding_box()
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return {}
+        if not box:
+            return {"inside_post_button": None, "top": None}
+        center = {"x": box["x"] + box["width"] / 2, "y": box["y"] + box["height"] / 2}
+        script = r"""
+(button, center) => {
+  const top = document.elementFromPoint(center.x, center.y);
+  if (!top) return {inside_post_button: null, top: null};
+  return {
+    inside_post_button: button.contains(top),
+    is_button_itself: top === button,
+    top: {
+      tag: (top.tagName || "").toLowerCase(),
+      role: top.getAttribute("role"),
+      testid: top.getAttribute("data-testid"),
+      aria_label: (top.getAttribute("aria-label") || "").slice(0, 120),
+      title: (top.getAttribute("title") || "").slice(0, 120),
+      class: (top.getAttribute("class") || "").slice(0, 120),
+      text: (top.innerText || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    },
+  };
+}
+"""
+        try:
+            value = button.evaluate(script, center)
+            return value if isinstance(value, dict) else {}
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return {}
+
+    def _capture_failure_screenshot(self, page) -> str | None:
+        """Best-effort click-failure screenshot; never required for the result."""
+        if not self.logs_dir:
+            return None
+        try:
+            directory = Path(self.logs_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            name = "x_post_click_timeout_%s.png" % time.strftime("%Y%m%d_%H%M%S")
+            path = directory / name
+            page.screenshot(path=str(path))
+            return str(path)
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return None
+
+    @classmethod
+    def _reconcile_click_timeout(cls, page, click_error_text: str) -> dict:
+        """Resolve the ambiguous click-timeout outcome within a short window.
+
+        The Playwright click may have reached X before timing out, so a click
+        timeout is NEVER immediately declared failed. A positive "Your post was
+        sent" signal wins; compose disappearance without it stays unverified;
+        anything else is the click-timeout failure. No second click ever.
+        """
+        deadline = time.monotonic() + POST_CLICK_RECONCILE_SECONDS
+        while True:
+            remaining = cls._remaining_ms(deadline)
+            if problem := cls.detect_problem(page):
+                log.warning(
+                    "Post click call timed out and X reported a problem: %r "
+                    "(playwright_error=%r)",
+                    problem,
+                    click_error_text,
+                )
+                return {"ok": False, "reason": problem}
+            if cls._has_positive_success(page):
+                log.info(
+                    "Post click call timed out, but X positive success "
+                    "confirmation was observed; publication verified "
+                    "(playwright_error=%r)",
+                    click_error_text,
+                )
+                return {"ok": True, "reason": "posted"}
+            navigated = False
+            try:
+                navigated = "compose/post" not in page.url
+            except Exception:
+                pass
+            if navigated:
+                log.warning(
+                    "Post click call timed out and the compose disappeared "
+                    "without positive success confirmation; publication is "
+                    "unverified (playwright_error=%r)",
+                    click_error_text,
+                )
+                return {"ok": False, "reason": "unverified"}
+            if remaining <= 0:
+                return {"ok": False, "reason": "post_button_click_timeout"}
+            page.wait_for_timeout(min(500, max(1, remaining)))
+
     # ------------------------------------------------------------- posting
 
     def post(
@@ -978,13 +1105,16 @@ class XSession:
         *,
         media_kind: str = "image",
         ready_timeout_s: int | float | None = None,
+        post_click_timeout_s: int | None = None,
     ) -> dict:
         """Post one tweet with attached media.
 
         ``media_kind`` describes the attached set; callers must use ``video``
         when any attachment is a video. ``ready_timeout_s`` applies only to
-        Post-button readiness/actionability, not general DOM operations or the
-        separate positive-confirmation phase.
+        Post-button readiness (media processing), never to the physical click
+        or the separate positive-confirmation phase. ``post_click_timeout_s``
+        bounds only the physical Post-click action; it is independent of media
+        readiness so an actionability failure cannot burn the readiness budget.
         """
         timeout_ms = max(1, int(timeout_s * 1000))
         if ready_timeout_s is None:
@@ -992,6 +1122,9 @@ class XSession:
             # always supplies the centrally validated media-specific value.
             ready_timeout_s = timeout_s
         ready_timeout_ms = max(1, int(ready_timeout_s * 1000))
+        if post_click_timeout_s is None:
+            post_click_timeout_s = DEFAULT_POST_CLICK_TIMEOUT_SECONDS
+        post_click_ms = max(1, int(post_click_timeout_s * 1000))
         for p in media_paths:
             if not Path(p).exists():
                 return {"ok": False, "reason": f"missing media file {p}"}
@@ -1066,24 +1199,101 @@ class XSession:
             )
             if not readiness["ready"]:
                 return {"ok": False, "reason": readiness["reason"]}
-            click_timeout_ms = self._remaining_ms(readiness_deadline)
-            if click_timeout_ms <= 0:
-                return {"ok": False, "reason": "post_button_disabled_timeout"}
+
+            # X re-renders the composer when media transitions to Ready, so a
+            # locator resolved before readiness may be stale. Never reuse it:
+            # freshly rediscover the active surface, revalidate attachment and
+            # caption, and re-select the Post button inside the fresh surface
+            # immediately before the click. All bounded by the click budget.
+            fresh_surface = self._find_active_compose_surface(
+                page, timeout_ms=post_click_ms
+            )
+            fresh_attachment = self._unique_matching_locator(
+                page,
+                fresh_surface.root,
+                ATTACHMENT_SELECTORS,
+                state="visible",
+                timeout_ms=post_click_ms,
+                failure_reason=(
+                    "attachments_not_found: X media attachment was not visible "
+                    "before click"
+                ),
+                ambiguity_reason="ambiguous_attachments",
+                stage="attachments",
+            )
+            if caption:
+                fresh_has_text = self._composer_has_text(fresh_surface.composer)
+                if fresh_has_text is False:
+                    return {"ok": False, "reason": "caption_lost_before_click"}
+            fresh_post_btn = self._find_owned_post_button(
+                page,
+                fresh_surface,
+                timeout_ms=post_click_ms,
+            )
+
+            # Re-enter bounded readiness against the fresh controls only if
+            # they are not yet actionable; the budget here is the click
+            # timeout, never the media-readiness deadline.
+            click_started_at = time.monotonic()
+            click_deadline = click_started_at + (post_click_ms / 1000.0)
+            click_readiness = self._wait_until_post_ready(
+                page,
+                fresh_post_btn,
+                fresh_attachment,
+                click_deadline,
+                composer_non_empty=composer_non_empty,
+                caption_text=caption,
+                media_kind=media_kind,
+                configured_timeout_seconds=post_click_ms / 1000.0,
+                readiness_started_at=click_started_at,
+                compose_surface=fresh_surface,
+            )
+            if not click_readiness["ready"]:
+                return {"ok": False, "reason": click_readiness["reason"]}
+            click_timeout_ms = min(
+                post_click_ms, max(1, self._remaining_ms(click_deadline))
+            )
+            if log.isEnabledFor(logging.DEBUG):
+                try:
+                    log.debug(
+                        "X pre-click state: compose_root=%r post_testid=%r "
+                        "visible=%s enabled=%s bounding_box=%r pointer=%r",
+                        fresh_surface.kind,
+                        fresh_post_btn.get_attribute("data-testid"),
+                        fresh_post_btn.is_visible(),
+                        fresh_post_btn.is_enabled(),
+                        fresh_post_btn.bounding_box(),
+                        self._pointer_hit_diagnostics(page, fresh_post_btn),
+                    )
+                except Exception as exc:
+                    if is_closed_context_error(exc):
+                        raise
             try:
-                post_btn.click(timeout=click_timeout_ms)
-            except PlaywrightTimeoutError:
-                diagnostics = self._readiness_diagnostics(
+                fresh_post_btn.click(timeout=click_timeout_ms)
+            except PlaywrightTimeoutError as exc:
+                click_error_text = str(exc)[:PLAYWRIGHT_ERROR_MAX_CHARS]
+                click_diagnostics = self._readiness_diagnostics(
                     page,
-                    post_btn,
-                    attachment,
+                    fresh_post_btn,
+                    fresh_attachment,
                     composer_non_empty=composer_non_empty,
                     media_kind=media_kind,
-                    configured_timeout_seconds=ready_timeout_ms / 1000.0,
-                    readiness_started_at=readiness_started_at,
-                    compose_surface=compose,
+                    configured_timeout_seconds=post_click_ms / 1000.0,
+                    readiness_started_at=click_started_at,
+                    compose_surface=fresh_surface,
                 )
-                log.warning("X Post button click timed out: %r", diagnostics)
-                return {"ok": False, "reason": "post_button_click_timeout"}
+                click_diagnostics["post_click_timeout_seconds"] = (
+                    post_click_ms / 1000.0
+                )
+                click_diagnostics["playwright_error"] = click_error_text
+                click_diagnostics["pointer_hit"] = self._pointer_hit_diagnostics(
+                    page, fresh_post_btn
+                )
+                screenshot = self._capture_failure_screenshot(page)
+                if screenshot:
+                    click_diagnostics["screenshot"] = screenshot
+                log.warning("X Post button click timed out: %r", click_diagnostics)
+                return self._reconcile_click_timeout(page, click_error_text)
 
             # Success must be positively confirmed. Navigations, login/captcha
             # redirects or a changed URL are NEVER treated as proof of posting.
@@ -1093,7 +1303,7 @@ class XSession:
                 # navigation so a redirect to those pages fails the post.
                 if problem := self.detect_problem(page):
                     return {"ok": False, "reason": problem}
-                if page.locator("text=Your post was sent").count() > 0:
+                if self._has_positive_success(page):
                     return {"ok": True, "reason": "posted"}
                 try:
                     if "compose/post" not in page.url:

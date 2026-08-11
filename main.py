@@ -375,7 +375,10 @@ def mark_item_published(db, item) -> None:
 
 def post_selected_item(session, item: dict, cfg: dict) -> dict:
     """Publish one selected item with its validated media readiness budget."""
-    from config_validation import publisher_ready_timeout_seconds
+    from config_validation import (
+        publisher_post_click_timeout_seconds,
+        publisher_ready_timeout_seconds,
+    )
 
     media_kind = item.get("kind", "image")
     return session.post(
@@ -383,6 +386,7 @@ def post_selected_item(session, item: dict, cfg: dict) -> dict:
         [item["_media_path"]],
         media_kind=media_kind,
         ready_timeout_s=publisher_ready_timeout_seconds(cfg, media_kind),
+        post_click_timeout_s=publisher_post_click_timeout_seconds(cfg),
     )
 
 

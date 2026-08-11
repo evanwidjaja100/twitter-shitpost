@@ -158,36 +158,46 @@ def test_timeout_s_is_forwarded_as_ms(publisher):
     session, page, media = publisher
     res = session.post("hello world", [media], timeout_s=60)
     assert res["ok"] is True
-    expected = {
-        COMPOSER: 60000 // len(COMPOSER_SELECTORS),
-        FILE_INPUT: 60000,
-        ATTACHMENTS: 60000,
-    }
-    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS):
-        calls = page._locators[selector].wait_for_calls
-        assert calls, f"no wait_for recorded for {selector}"
-        for call in calls:
-            assert call["timeout"] == expected[selector], (selector, call)
-    post_timeout = page._locators[POST_BTN].wait_for_calls[0]["timeout"]
-    assert 0 < post_timeout <= 60000
-    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= post_timeout
+    # Initial discovery uses the outer operation budget; the pre-click fresh
+    # re-resolution uses the dedicated post-click budget (default 15s).
+    assert [c["timeout"] for c in page._locators[COMPOSER].wait_for_calls] == [
+        60000 // len(COMPOSER_SELECTORS),
+        15000 // len(COMPOSER_SELECTORS),
+    ]
+    assert [c["timeout"] for c in page._locators[FILE_INPUT].wait_for_calls] == [
+        60000,
+    ]
+    assert [c["timeout"] for c in page._locators[ATTACHMENTS].wait_for_calls] == [
+        60000,
+        15000,
+    ]
+    assert [c["timeout"] for c in page._locators[POST_BTN].wait_for_calls] == [
+        60000,
+        15000,
+    ]
+    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= 15000
 
 
 def test_short_timeout_maps_to_ms(publisher):
     session, page, media = publisher
     res = session.post("cap", [media], timeout_s=1)
     assert res["ok"] is True
-    expected = {
-        COMPOSER: max(1, 1000 // len(COMPOSER_SELECTORS)),
-        FILE_INPUT: 1000,
-        ATTACHMENTS: 1000,
-    }
-    for selector in (COMPOSER, FILE_INPUT, ATTACHMENTS):
-        for call in page._locators[selector].wait_for_calls:
-            assert call["timeout"] == expected[selector], (selector, call)
-    post_timeout = page._locators[POST_BTN].wait_for_calls[0]["timeout"]
-    assert 0 < post_timeout <= 1000
-    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= post_timeout
+    assert [c["timeout"] for c in page._locators[COMPOSER].wait_for_calls] == [
+        max(1, 1000 // len(COMPOSER_SELECTORS)),
+        15000 // len(COMPOSER_SELECTORS),
+    ]
+    assert [c["timeout"] for c in page._locators[FILE_INPUT].wait_for_calls] == [
+        1000,
+    ]
+    assert [c["timeout"] for c in page._locators[ATTACHMENTS].wait_for_calls] == [
+        1000,
+        15000,
+    ]
+    assert [c["timeout"] for c in page._locators[POST_BTN].wait_for_calls] == [
+        1000,
+        15000,
+    ]
+    assert 0 < page._locators[POST_BTN].click_timeouts[0] <= 15000
 
 
 def test_composer_is_clicked_before_typing(publisher):

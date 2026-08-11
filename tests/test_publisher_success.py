@@ -306,8 +306,10 @@ def test_non_textarea_composer_is_found_and_typed(media):
     composer = page.locator(COMPOSER)
     assert composer.click_calls == 1
     assert "".join(composer.typed_chunks) == "hello world"
-    assert composer.evaluate_calls == 1
-    assert composer.inner_text_calls == 1
+    # evaluate runs once for the initial verify and once for the fresh
+    # pre-click revalidation of the re-rendered composer.
+    assert composer.evaluate_calls == 2
+    assert composer.inner_text_calls == 2
     assert page.locator(DIV_COMPOSER) is composer
 
 
@@ -323,7 +325,8 @@ def test_legacy_textarea_with_same_testid_still_works(media):
     assert res == {"ok": True, "reason": "posted"}
     assert page.locator(LEGACY_TEXTAREA) is page.locator(COMPOSER)
     assert "".join(page.locator(LEGACY_TEXTAREA).typed_chunks) == "hello world"
-    assert page.locator(LEGACY_TEXTAREA).input_value_calls == 1
+    # once for the initial verify, once for the fresh pre-click revalidation.
+    assert page.locator(LEGACY_TEXTAREA).input_value_calls == 2
 
 
 def test_primary_missing_uses_scoped_dialog_fallback(media):
@@ -457,9 +460,11 @@ def test_visible_disabled_button_waits_until_enabled_then_posts(media):
 
     button = page.locator(POST_BTN)
     assert res == {"ok": True, "reason": "posted"}
-    assert page.post_readiness_polls == 3
+    # 3 polls to reach readiness + 1 confirmation poll during the fresh
+    # pre-click re-wait; the click still carries the dedicated short budget.
+    assert page.post_readiness_polls == 4
     assert button.click_calls == 1
-    assert 0 < button.click_timeouts[0] < 1000
+    assert 0 < button.click_timeouts[0] <= 15000
 
 
 def test_visible_button_that_remains_disabled_fails_without_click(media, caplog):
@@ -554,7 +559,8 @@ def test_enabled_button_click_timeout_has_stable_failure(media):
     assert res == {"ok": False, "reason": "post_button_click_timeout"}
     button = page.locator(POST_BTN)
     assert button.click_calls == 1
-    assert 0 < button.click_timeouts[0] <= 1000
+    # The dedicated post-click budget (default 15s), not the outer deadline.
+    assert 0 < button.click_timeouts[0] <= 15000
 
 
 def test_video_can_remain_disabled_past_60_seconds_then_post(media, caplog):

@@ -29,7 +29,8 @@
   },
   "publisher": {
     "image_ready_timeout_seconds": 60,
-    "video_ready_timeout_seconds": 180
+    "video_ready_timeout_seconds": 180,
+    "post_click_timeout_seconds": 15
   },
   "tiktok": {
     "foryou": true,

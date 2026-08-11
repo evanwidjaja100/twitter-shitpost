@@ -402,6 +402,17 @@ class TestBackwardCompatibility:
         assert config_validation.publisher_ready_timeout_seconds(cfg, "image") == 15
         assert config_validation.publisher_ready_timeout_seconds(cfg, "video") == 240
 
+    def test_missing_post_click_timeout_uses_default(self):
+        cfg = _valid()
+        assert config_validation.validate_config(cfg) == []
+        assert config_validation.publisher_post_click_timeout_seconds(cfg) == 15
+
+    def test_custom_post_click_timeout_is_selected(self):
+        cfg = _valid()
+        cfg["publisher"]["post_click_timeout_seconds"] = 25
+        assert config_validation.validate_config(cfg) == []
+        assert config_validation.publisher_post_click_timeout_seconds(cfg) == 25
+
     @pytest.mark.parametrize(
         ("field", "bad", "message"),
         (
@@ -409,6 +420,11 @@ class TestBackwardCompatibility:
             ("video_ready_timeout_seconds", -10, ">= 1"),
             ("video_ready_timeout_seconds", "180", "integer"),
             ("image_ready_timeout_seconds", None, "integer"),
+            ("post_click_timeout_seconds", 0, ">= 1"),
+            ("post_click_timeout_seconds", -1, ">= 1"),
+            ("post_click_timeout_seconds", None, "integer"),
+            ("post_click_timeout_seconds", "15", "integer"),
+            ("post_click_timeout_seconds", True, "integer"),
         ),
     )
     def test_invalid_media_readiness_timeout_is_rejected(self, field, bad, message):

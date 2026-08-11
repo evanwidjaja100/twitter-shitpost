@@ -165,6 +165,8 @@ class TestCmdOnce:
             "captcha",
             "login",
             "post_button_disabled_timeout",
+            "post_button_click_timeout",
+            "caption_lost_before_click",
             "ambiguous_post_button",
             "media_editor_unresolved",
         ]
@@ -178,6 +180,25 @@ class TestCmdOnce:
         assert not db.is_source_seen("youtube", "vid-1")
         assert not db.is_hash_seen("deadbeef1234", 30)
         alert.assert_called_once()
+
+    def test_click_timeout_with_positive_toast_records_dedup(self, tmp_path):
+        """A click call that timed out but X positively confirmed the post
+        returns posted and finalizes success like any verified publication."""
+        item = _item(kind="video", _fingerprints=["frame-a", "frame-b"])
+        db, session, alert = self._run(
+            tmp_path,
+            item=item,
+            pick=item,
+            session_result={"ok": True, "reason": "posted"},
+        )
+        assert session.post.call_count == 1
+        assert db.is_source_seen("youtube", "vid-1")
+        assert db.is_hash_seen("deadbeef1234", 30)
+        groups = db.fingerprint_groups("video", 30)
+        assert len(groups) == 1
+        assert groups[0]["content_hash"] == "deadbeef1234"
+        assert groups[0]["fingerprints"] == ["frame-a", "frame-b"]
+        alert.assert_not_called()
 
 
 class TestMarkItemPublished:

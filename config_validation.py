@@ -53,6 +53,7 @@ _POSTING_STYLES = ("title", "pool", "both")
 
 DEFAULT_IMAGE_READY_TIMEOUT_SECONDS = 60
 DEFAULT_VIDEO_READY_TIMEOUT_SECONDS = 180
+DEFAULT_POST_CLICK_TIMEOUT_SECONDS = 15
 
 # Maintained inventory of every nested value that production deliberately
 # hard-indexes. Optional values are consumed with ``.get`` defaults instead.
@@ -216,6 +217,21 @@ def publisher_ready_timeout_seconds(cfg: dict, media_kind: str) -> int:
     return _as_int(section.get(field), default)
 
 
+def publisher_post_click_timeout_seconds(cfg: dict) -> int:
+    """Return the validated physical Post-click actionability maximum.
+
+    This bounds only the Playwright click action, never the media-readiness
+    wait. Absent from older configs => documented default.
+    """
+    section = cfg.get("publisher", {})
+    if not isinstance(section, dict):
+        return DEFAULT_POST_CLICK_TIMEOUT_SECONDS
+    return _as_int(
+        section.get("post_click_timeout_seconds"),
+        DEFAULT_POST_CLICK_TIMEOUT_SECONDS,
+    )
+
+
 def _require_production_fields(cfg, errors):
     """Reject a missing/null hard-indexed leaf with one actionable error."""
     for path in PRODUCTION_REQUIRED_PATHS:
@@ -297,6 +313,7 @@ def validate_config(cfg: dict) -> list[str]:
             for field in (
                 "image_ready_timeout_seconds",
                 "video_ready_timeout_seconds",
+                "post_click_timeout_seconds",
             ):
                 if field not in publisher:
                     continue

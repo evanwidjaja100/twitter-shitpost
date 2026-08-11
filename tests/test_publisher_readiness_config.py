@@ -31,6 +31,7 @@ def test_selected_video_uses_configured_video_readiness_timeout():
         ["media.mp4"],
         media_kind="video",
         ready_timeout_s=240,
+        post_click_timeout_s=15,
     )
 
 
@@ -50,6 +51,7 @@ def test_selected_image_uses_configured_image_readiness_timeout():
         ["media.jpg"],
         media_kind="image",
         ready_timeout_s=15,
+        post_click_timeout_s=15,
     )
 
 
@@ -62,3 +64,14 @@ def test_old_config_production_wiring_uses_documented_defaults():
 
     assert image_session.post.call_args.kwargs["ready_timeout_s"] == 60
     assert video_session.post.call_args.kwargs["ready_timeout_s"] == 180
+    assert image_session.post.call_args.kwargs["post_click_timeout_s"] == 15
+    assert video_session.post.call_args.kwargs["post_click_timeout_s"] == 15
+
+
+def test_configured_post_click_timeout_is_forwarded():
+    session = mock.Mock()
+    cfg = {"publisher": {"post_click_timeout_seconds": 25}}
+
+    main.post_selected_item(session, _item("image"), cfg)
+
+    assert session.post.call_args.kwargs["post_click_timeout_s"] == 25
