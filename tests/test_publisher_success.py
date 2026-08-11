@@ -439,8 +439,10 @@ def test_no_positive_confirmation_times_out(media):
     assert clock.time() >= 1_000_000.0 + 1.0  # deadline was enforced
 
 
-def test_problem_checked_before_url_interpreting(media):
-    """Login state + navigation: must be login failure, never success."""
+def test_success_toast_coexisting_with_login_surface_after_click_is_posted(media):
+    """Post-click phase: an explicit positive confirmation observed alongside
+    a login surface wins — the post was sent. (The pre-click login guard is
+    pinned separately below.)"""
     page = FakePage(
         body_text="Sign in to continue",
         after_post_url=LOGIN_URL,
@@ -449,8 +451,21 @@ def test_problem_checked_before_url_interpreting(media):
         sent_toast=True,
     )
     res = _post(page, media)
+    assert res == {"ok": True, "reason": "posted"}
+
+
+def test_login_surface_before_click_still_blocks(media):
+    """Phase boundary: a login surface visible BEFORE the Post click stops
+    the post with zero clicks even when a success toast is already on screen."""
+    page = FakePage(
+        body_text="Sign in to continue",
+        sent_toast=True,
+    )
+    page.login_link_count = 1
+    res = _post(page, media)
     assert res["ok"] is False
     assert res["reason"] == "login"
+    assert page.locator(POST_BTN).click_calls == 0
 
 
 def test_visible_disabled_button_waits_until_enabled_then_posts(media):

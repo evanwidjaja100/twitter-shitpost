@@ -191,6 +191,8 @@ class Locator:
         }
         if is_post_button:
             self.page.click_timeouts.append(timeout)
+            if self.page.problem_on_click:
+                self.page.problem_active = True
         if is_post_button and self.page.post_click_error is not None:
             if self.page.navigate_on_click_timeout:
                 self.page.apply_click_timeout_navigation()
@@ -228,7 +230,10 @@ class Locator:
         return "".join(self._one().typed)
 
     def inner_text(self, timeout=None):
-        return self._one().text or "".join(self._one().typed)
+        element = self._one()
+        if element.selector == BODY:
+            return self.page.body_inner_text()
+        return element.text or "".join(element.typed)
 
     def is_visible(self):
         return self._one().visible
@@ -258,6 +263,9 @@ class Page:
         navigate_on_click_timeout=False,
         element_from_point=None,
         rerender_fn=None,
+        problem_text=None,
+        problem_after_seconds=None,
+        problem_on_click=False,
     ):
         self.body = body
         self.clock = clock or FakeClock()
@@ -268,6 +276,10 @@ class Page:
         self.navigate_on_click_timeout = navigate_on_click_timeout
         self.element_from_point = element_from_point
         self.rerender_fn = rerender_fn
+        self.problem_text = problem_text
+        self.problem_after_seconds = problem_after_seconds
+        self.problem_on_click = problem_on_click
+        self.problem_active = False
         self.rerendered = False
         self.compose_finds = 0
         self.started_at = self.clock.time()
@@ -312,6 +324,13 @@ class Page:
             if element.attrs.get("data-testid") in {"tweetTextarea_0", "attachments"}:
                 element.visible = False
 
+    def body_inner_text(self):
+        text = self.body.text or ""
+        if self.problem_text and (not self.problem_on_click or self.problem_active):
+            if self.problem_after_seconds is None or self.elapsed >= self.problem_after_seconds:
+                text += "\n" + self.problem_text
+        return text
+
     def wait_for_timeout(self, milliseconds):
         self.waits.append(milliseconds)
         self.clock.advance(milliseconds / 1000)
@@ -355,6 +374,9 @@ def build_page(
     navigate_on_click_timeout=False,
     element_from_point=None,
     rerender_fn=None,
+    problem_text=None,
+    problem_after_seconds=None,
+    problem_on_click=False,
 ):
     body = node(BODY, text="compose page")
     stale_dialog = body.add(
@@ -396,6 +418,9 @@ def build_page(
         navigate_on_click_timeout=navigate_on_click_timeout,
         element_from_point=element_from_point,
         rerender_fn=rerender_fn,
+        problem_text=problem_text,
+        problem_after_seconds=problem_after_seconds,
+        problem_on_click=problem_on_click,
     )
     return page, {
         "stale_dialog": stale_dialog,
@@ -765,3 +790,123 @@ def test_click_timeout_captures_best_effort_screenshot(tmp_path, media, caplog):
     assert screenshot_path.startswith(str(logs))
     assert Path(screenshot_path).exists()
     assert repr(screenshot_path) in caplog.text
+
+
+# ------------------------------------------- post-click success over error UI
+
+
+def test_a_success_and_error_coexist_after_normal_click_is_posted(media, caplog):
+    """'Your post was sent' AND 'Something went wrong' visible after a normal
+    click: the explicit positive confirmation wins."""
+    caplog.set_level(logging.INFO, logger="publisher")
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        sent_toast=True,
+        problem_text="Something went wrong",
+        problem_on_click=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert elements["active_post"].click_count == 1
+    assert "takes precedence" in caplog.text
+
+
+def test_b_click_timeout_success_and_error_coexist_is_posted(media):
+    """The most important regression: click() timed out, but during
+    reconciliation both the positive confirmation and a generic X problem are
+    visible. Success wins and the click was attempted exactly once."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        sent_toast=True,
+        problem_text="Something went wrong",
+        problem_on_click=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert elements["active_post"].click_count == 1
+
+
+def test_c_generic_error_only_after_normal_click_is_failure(media):
+    """Generic X error with no positive confirmation after a normal click
+    still fails; success precedence does not disable error detection."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        problem_text="Something went wrong",
+        problem_on_click=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "error"}
+    assert elements["active_post"].click_count == 1
+
+
+def test_d_generic_error_only_after_click_timeout_is_failure(media, caplog):
+    """A click timeout with only a generic problem visible stays a failure;
+    not every ambiguous timeout becomes success."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        problem_text="Something went wrong",
+        problem_on_click=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "error"}
+    assert elements["active_post"].click_count == 1
+    assert "timed out and X reported a problem" in caplog.text
+
+
+def test_g_pre_click_problem_still_blocks_posting(media):
+    """Phase boundary: a problem visible BEFORE the click attempt stops the
+    post with zero clicks, even when a success toast is already on screen."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        sent_toast=True,
+        problem_text="Something went wrong",
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "error"}
+    assert elements["active_post"].click_count == 0
+
+
+def test_h_no_success_inference_before_click_attempt(media):
+    """A success toast present before this session's Post action must never
+    yield 'posted' without an actual click attempt."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL, sent_toast=True
+    )
+    elements["active_post"].visible = False
+
+    result = post(page, media)
+
+    assert result["ok"] is False
+    assert result["reason"] != "posted"
+    assert elements["active_post"].click_count == 0
+
+
+def test_i_error_before_success_terminates_reconciliation(media):
+    """Pinned policy: during reconciliation a generic X problem observed
+    without the positive confirmation immediately fails the post. The success
+    toast arriving later is never reached — no speculative grace window."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        problem_text="Something went wrong",
+        problem_on_click=True,
+        toast_after_seconds=2,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "error"}
+    assert elements["active_post"].click_count == 1
+    assert page.elapsed < 1.0

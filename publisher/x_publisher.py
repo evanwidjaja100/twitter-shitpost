@@ -990,6 +990,34 @@ class XSession:
                 raise
             return False
 
+    @classmethod
+    def _post_click_result(cls, page) -> dict | None:
+        """Post-click result decision: verified success wins over a generic/
+        stale X problem in the same observation. POST-CLICK PHASE ONLY —
+        never used to gate the click itself.
+
+        Returns ``{"ok": True, "reason": "posted"}``, a failure dict, or
+        ``None`` while the outcome is still pending. ``None`` on a checked
+        exception so an unreadable page just keeps polling.
+        """
+        try:
+            if cls._has_positive_success(page):
+                if problem := cls.detect_problem(page):
+                    log.info(
+                        "X positive post confirmation observed alongside "
+                        "generic error UI (%r); positive publication "
+                        "confirmation takes precedence",
+                        problem,
+                    )
+                return {"ok": True, "reason": "posted"}
+            if problem := cls.detect_problem(page):
+                return {"ok": False, "reason": problem}
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return None
+        return None
+
     @staticmethod
     def _pointer_hit_diagnostics(page, button) -> dict:
         """Report which element receives pointer events at the button center.
@@ -1062,22 +1090,22 @@ class XSession:
         deadline = time.monotonic() + POST_CLICK_RECONCILE_SECONDS
         while True:
             remaining = cls._remaining_ms(deadline)
-            if problem := cls.detect_problem(page):
-                log.warning(
-                    "Post click call timed out and X reported a problem: %r "
-                    "(playwright_error=%r)",
-                    problem,
-                    click_error_text,
-                )
-                return {"ok": False, "reason": problem}
-            if cls._has_positive_success(page):
-                log.info(
-                    "Post click call timed out, but X positive success "
-                    "confirmation was observed; publication verified "
-                    "(playwright_error=%r)",
-                    click_error_text,
-                )
-                return {"ok": True, "reason": "posted"}
+            if result := cls._post_click_result(page):
+                if result["ok"]:
+                    log.info(
+                        "Post click call timed out, but X positive success "
+                        "confirmation was observed; publication verified "
+                        "(playwright_error=%r)",
+                        click_error_text,
+                    )
+                else:
+                    log.warning(
+                        "Post click call timed out and X reported a problem: "
+                        "%r (playwright_error=%r)",
+                        result["reason"],
+                        click_error_text,
+                    )
+                return result
             navigated = False
             try:
                 navigated = "compose/post" not in page.url
@@ -1299,12 +1327,12 @@ class XSession:
             # redirects or a changed URL are NEVER treated as proof of posting.
             deadline = time.monotonic() + (timeout_ms / 1000.0)
             while time.monotonic() < deadline:
-                # Login/captcha/error state is checked before interpreting any
-                # navigation so a redirect to those pages fails the post.
-                if problem := self.detect_problem(page):
-                    return {"ok": False, "reason": problem}
-                if self._has_positive_success(page):
-                    return {"ok": True, "reason": "posted"}
+                # Post-click phase: an explicit positive confirmation wins over
+                # a generic/stale X problem in the same observation. Problem
+                # detection still precedes the navigation check so a redirect
+                # to login/captcha without the success signal still fails.
+                if result := self._post_click_result(page):
+                    return result
                 try:
                     if "compose/post" not in page.url:
                         # Navigated away without the success signal and without

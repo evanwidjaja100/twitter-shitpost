@@ -198,6 +198,30 @@ class TestCmdOnce:
         assert len(groups) == 1
         assert groups[0]["content_hash"] == "deadbeef1234"
         assert groups[0]["fingerprints"] == ["frame-a", "frame-b"]
+        posts = db._conn.execute("SELECT COUNT(*) AS n FROM posts").fetchone()["n"]
+        assert posts == 1
+        alert.assert_not_called()
+
+    def test_posted_coexistence_success_finalizes_exactly_once(self, tmp_path):
+        """The publisher returns posted when 'Your post was sent' coexists with
+        a generic X error after the click (normal or timeout path); the
+        orchestration must finalize the successful dedup state exactly once
+        with no duplicate inserts."""
+        item = _item(kind="video", _fingerprints=["frame-a", "frame-b"])
+        db, session, alert = self._run(
+            tmp_path,
+            item=item,
+            pick=item,
+            session_result={"ok": True, "reason": "posted"},
+        )
+        assert session.post.call_count == 1
+        assert db.is_source_seen("youtube", "vid-1")
+        assert db.is_hash_seen("deadbeef1234", 30)
+        groups = db.fingerprint_groups("video", 30)
+        assert len(groups) == 1
+        assert groups[0]["fingerprints"] == ["frame-a", "frame-b"]
+        posts = db._conn.execute("SELECT COUNT(*) AS n FROM posts").fetchone()["n"]
+        assert posts == 1
         alert.assert_not_called()
 
 
