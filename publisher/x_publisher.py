@@ -103,6 +103,15 @@ READINESS_POLL_MS = 250
 POST_CLICK_RECONCILE_SECONDS = 5.0
 PLAYWRIGHT_ERROR_MAX_CHARS = 4000
 
+# Click-timeout classification outcomes (Part A). The guarded keyboard
+# fallback is eligible ONLY for POINTER_INTERCEPTED; every other outcome fails
+# safely through the existing paths with no second activation attempt.
+TIMEOUT_CLASS_POINTER_INTERCEPTED = "pointer_intercepted"
+TIMEOUT_CLASS_DETACHED = "detached"
+TIMEOUT_CLASS_UNSTABLE = "unstable"
+TIMEOUT_CLASS_CONTEXT_CLOSED = "context_closed"
+TIMEOUT_CLASS_UNKNOWN = "unknown"
+
 # Ordered, maintainable X compose selectors. The stable test ID is deliberately
 # tag-agnostic: X currently renders a contenteditable ``div`` but has rendered
 # a ``textarea`` in the past. Fallback textboxes are restricted to known compose
@@ -1123,6 +1132,241 @@ class XSession:
                 return {"ok": False, "reason": "post_button_click_timeout"}
             page.wait_for_timeout(min(500, max(1, remaining)))
 
+    # ---------------------------------------------- timeout classification
+
+    @classmethod
+    def _classify_post_click_timeout(
+        cls, exc, pointer_hit, exception_text: str | None = None
+    ) -> str:
+        """Narrowly classify a normal-click timeout into a stable outcome.
+
+        Keyboard fallback is reserved for ``POINTER_INTERCEPTED`` alone. That
+        requires BOTH the live Playwright text marking pointer-event
+        interception (never a CSS-class dependency) AND the button-center hit
+        test placing the top element outside the Post button. A generic,
+        detached, unstable or context-closed timeout never qualifies.
+        """
+        if is_closed_context_error(exc):
+            return TIMEOUT_CLASS_CONTEXT_CLOSED
+        text = (exception_text if exception_text is not None else str(exc)).lower()
+        if "intercepts pointer events" in text:
+            if isinstance(pointer_hit, dict) and pointer_hit.get(
+                "inside_post_button"
+            ) is False:
+                return TIMEOUT_CLASS_POINTER_INTERCEPTED
+            return TIMEOUT_CLASS_UNKNOWN
+        if "detached" in text or "not attached" in text:
+            return TIMEOUT_CLASS_DETACHED
+        if "not stable" in text or "not visible" in text or "not enabled" in text:
+            return TIMEOUT_CLASS_UNSTABLE
+        return TIMEOUT_CLASS_UNKNOWN
+
+    @staticmethod
+    def _verify_focus(page, button) -> bool:
+        """Prove the verified Post button (or a semantic descendant) owns
+        browser keyboard focus before any keyboard activation."""
+        script = r"""
+(button) => {
+  const active = document.activeElement;
+  if (active === button) return true;
+  return !!(button.contains && button.contains(active));
+}
+"""
+        try:
+            value = button.evaluate(script)
+            return bool(value)
+        except Exception as exc:
+            if is_closed_context_error(exc):
+                raise
+            return False
+
+    @classmethod
+    def _confirm_after_keyboard(cls, page) -> dict:
+        """Bounded confirmation after a single keyboard activation.
+
+        Success still requires the explicit \"Your post was sent\" signal via
+        :meth:`_post_click_result` (which preserves success-over-error
+        precedence). No second activation is ever attempted in this phase.
+        """
+        deadline = time.monotonic() + POST_CLICK_RECONCILE_SECONDS
+        while True:
+            remaining = cls._remaining_ms(deadline)
+            if result := cls._post_click_result(page):
+                return result
+            navigated = False
+            try:
+                navigated = "compose/post" not in page.url
+            except Exception:
+                pass
+            if navigated:
+                log.warning(
+                    "X Post keyboard activation submitted but the compose "
+                    "disappeared without positive confirmation; publication is "
+                    "unverified"
+                )
+                return {
+                    "ok": False,
+                    "reason": "post_button_keyboard_activation_unverified",
+                }
+            if remaining <= 0:
+                return {
+                    "ok": False,
+                    "reason": "post_button_keyboard_activation_unverified",
+                }
+            page.wait_for_timeout(min(500, max(1, remaining)))
+
+    @classmethod
+    def _keyboard_fallback_if_safe(
+        cls,
+        page,
+        exc,
+        *,
+        exception_text,
+        pointer_hit,
+        caption,
+        media_kind,
+        composer_non_empty,
+        post_click_ms,
+        post_click_timeout_seconds,
+    ) -> dict:
+        """One tightly guarded Enter fallback for proven pointer interception.
+
+        Called ONLY after the existing mouse-click reconciliation finished with
+        ``post_button_click_timeout`` (reconciliation found no positive success
+        and no redirected/compose-disappeared ambiguity). Every eligibility
+        precondition is re-verified against a freshly rediscovered compose,
+        focus ownership is proven, and exactly one Enter is sent.
+        """
+        classification = cls._classify_post_click_timeout(
+            exc, pointer_hit, exception_text=exception_text
+        )
+        if classification != TIMEOUT_CLASS_POINTER_INTERCEPTED:
+            return {"ok": False, "reason": "post_button_click_timeout"}
+
+        log.warning(
+            "X Post mouse click was blocked by verified pointer interception; "
+            "attempting one keyboard activation on the freshly validated "
+            "Post button"
+        )
+
+        fresh_surface = cls._find_active_compose_surface(
+            page, timeout_ms=post_click_ms
+        )
+        fresh_attachment = cls._unique_matching_locator(
+            page,
+            fresh_surface.root,
+            ATTACHMENT_SELECTORS,
+            state="visible",
+            timeout_ms=post_click_ms,
+            failure_reason=(
+                "attachments_not_found: X media attachment was not visible "
+                "before keyboard fallback"
+            ),
+            ambiguity_reason="ambiguous_attachments",
+            stage="attachments",
+        )
+        if caption:
+            fresh_has_text = cls._composer_has_text(fresh_surface.composer)
+            if fresh_has_text is False:
+                return {"ok": False, "reason": "caption_lost_before_click"}
+        fresh_post_btn = cls._find_owned_post_button(
+            page, fresh_surface, timeout_ms=post_click_ms
+        )
+
+        try:
+            fresh_visible = bool(fresh_post_btn.is_visible())
+            fresh_enabled = bool(fresh_post_btn.is_enabled())
+        except Exception as sub_exc:
+            if is_closed_context_error(sub_exc):
+                raise
+            fresh_visible = fresh_enabled = False
+        if not (fresh_visible and fresh_enabled):
+            return {"ok": False, "reason": "post_button_disabled_timeout"}
+
+        if problem := cls.detect_problem(page):
+            return {"ok": False, "reason": problem}
+
+        if media_kind == "video":
+            media_state = cls._video_attachment_state(fresh_attachment)
+            if media_state != "attachment_inline_ready":
+                return {
+                    "ok": False,
+                    "reason": "media_upload_error:media_processing_failed",
+                }
+            editor_state = cls._secondary_video_editor_state(page)
+            if editor_state.get("state") in {
+                "secondary_present",
+                "secondary_processing",
+                "secondary_error",
+            }:
+                return {
+                    "ok": False,
+                    "reason": "media_upload_error:media_processing_failed",
+                }
+
+        fresh_pointer_hit = cls._pointer_hit_diagnostics(page, fresh_post_btn)
+        if fresh_pointer_hit.get("inside_post_button") is not False:
+            return {"ok": False, "reason": "post_button_click_timeout"}
+
+        try:
+            fresh_post_btn.focus()
+        except Exception as sub_exc:
+            if is_closed_context_error(sub_exc):
+                raise
+            return {"ok": False, "reason": "post_button_keyboard_focus_failed"}
+        focus_verified = cls._verify_focus(page, fresh_post_btn)
+        if not focus_verified:
+            log.warning(
+                "X Post button keyboard focus verification failed; not "
+                "pressing Enter"
+            )
+            return {"ok": False, "reason": "post_button_keyboard_focus_failed"}
+
+        diagnostics = {
+            "mouse_click_timeout_seconds": post_click_timeout_seconds,
+            "playwright_error_classification": classification,
+            "pointer_intercepted": True,
+            "pointer_hit": pointer_hit,
+            "fresh_compose_root": fresh_surface.kind,
+            "fresh_button_testid": cls._safe_testid(fresh_post_btn),
+            "fresh_button_visible": fresh_visible,
+            "fresh_button_enabled": fresh_enabled,
+            "attachment_count": None,
+            "composer_non_empty": composer_non_empty,
+            "video_media_state": (
+                cls._video_attachment_state(fresh_attachment)
+                if media_kind == "video"
+                else None
+            ),
+            "focus_verified": focus_verified,
+            "keyboard_key": "Enter",
+        }
+        log.warning("X Post keyboard fallback selected: %r", diagnostics)
+
+        try:
+            fresh_post_btn.press("Enter")
+        except Exception as sub_exc:
+            if is_closed_context_error(sub_exc):
+                raise
+            return {
+                "ok": False,
+                "reason": "post_button_keyboard_activation_unverified",
+            }
+        log.info(
+            "X Post keyboard activation (Enter) sent; waiting for positive "
+            "publication confirmation"
+        )
+        return cls._confirm_after_keyboard(page)
+
+    @staticmethod
+    def _safe_testid(button):
+        """Best-effort data-testid for diagnostics (never fail on it)."""
+        try:
+            value = button.get_attribute("data-testid")
+            return value
+        except Exception:
+            return None
+
     # ------------------------------------------------------------- posting
 
     def post(
@@ -1321,7 +1565,26 @@ class XSession:
                 if screenshot:
                     click_diagnostics["screenshot"] = screenshot
                 log.warning("X Post button click timed out: %r", click_diagnostics)
-                return self._reconcile_click_timeout(page, click_error_text)
+                reconcile_result = self._reconcile_click_timeout(
+                    page, click_error_text
+                )
+                if reconcile_result.get("reason") == "post_button_click_timeout":
+                    # Reconciliation confirmed the mouse click did not post and
+                    # there is no redirect/compose-disappeared ambiguity. Only a
+                    # proven pointer-interception failure may now attempt one
+                    # guarded keyboard activation; all other timeouts fail here.
+                    return self._keyboard_fallback_if_safe(
+                        page,
+                        exc,
+                        exception_text=click_error_text,
+                        pointer_hit=click_diagnostics.get("pointer_hit"),
+                        caption=caption,
+                        media_kind=media_kind,
+                        composer_non_empty=composer_non_empty,
+                        post_click_ms=post_click_ms,
+                        post_click_timeout_seconds=post_click_ms / 1000.0,
+                    )
+                return reconcile_result
 
             # Success must be positively confirmed. Navigations, login/captcha
             # redirects or a changed URL are NEVER treated as proof of posting.

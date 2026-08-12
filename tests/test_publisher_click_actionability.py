@@ -1,4 +1,4 @@
-"""Deterministic regressions for the enabled-but-click-times-out repair.
+﻿"""Deterministic regressions for the enabled-but-click-times-out repair.
 
 The live X failure had a correct, enabled Post button whose Playwright click
 timed out after ~176s. This suite pins the four repairs:
@@ -12,7 +12,7 @@ timed out after ~176s. This suite pins the four repairs:
    signal wins; compose disappearance alone never counts as success; no
    automatic second click ever happens.
 
-Fakes only — no real X account, browser, or network.
+Fakes only â€” no real X account, browser, or network.
 """
 
 import logging
@@ -23,7 +23,14 @@ from unittest import mock
 import pytest
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-from publisher.x_publisher import XSession
+from publisher.x_publisher import (
+    TIMEOUT_CLASS_CONTEXT_CLOSED,
+    TIMEOUT_CLASS_DETACHED,
+    TIMEOUT_CLASS_POINTER_INTERCEPTED,
+    TIMEOUT_CLASS_UNKNOWN,
+    TIMEOUT_CLASS_UNSTABLE,
+    XSession,
+)
 
 COMPOSER = '[data-testid="tweetTextarea_0"]'
 FILE_INPUT = '[data-testid="fileInput"]'
@@ -198,13 +205,43 @@ class Locator:
                 self.page.apply_click_timeout_navigation()
             raise self.page.post_click_error
 
+    def focus(self):
+        self.page.focus_calls.append(self._one())
+
+    def press(self, key):
+        element = self._one()
+        if key != "Enter":
+            return
+        self.page.enter_count += 1
+        if not self.page.enter_activates:
+            return
+        # Simulates the semantic activation of the focused Post button: Enter
+        # submit optionally surfaces the explicit X success signal and/or a
+        # generic X problem (success-over-error precedence is handled by the
+        # publisher confirmation logic, which is what these tests verify).
+        if self.page.enter_problem:
+            self.page.problem_active = True
+        if self.page.enter_success:
+            self.page.sent_toast = True
+
     def bounding_box(self):
         return dict(self._one().rect)
 
     def evaluate(self, expression, arg=None):
         element = self._one()
+        if "activeElement" in str(expression):
+            return self.page.active_element_inside
         if "elementFromPoint" in str(expression):
             hit = self.page.element_from_point
+            self.page.element_from_point_calls += 1
+            if (
+                self.page.element_from_point_flip_after_calls is not None
+                and self.page.element_from_point_calls
+                > self.page.element_from_point_flip_after_calls
+            ):
+                # Simulate the overlaying element having disappeared: the hit
+                # now belongs to the Post button itself.
+                hit = element
             if hit is None:
                 return {"inside_post_button": None, "top": None}
             inside = hit is element or any(d is hit for d in element.descendants())
@@ -288,6 +325,23 @@ class Page:
         self.waits = []
         self.click_timeouts = []
         self.screenshot_calls = []
+        self.focus_calls = []
+        self.enter_count = 0
+        # elementFromPoint hit-test bookkeeping (for the overlay-disappeared case).
+        self.element_from_point_calls = 0
+        self.element_from_point_flip_after_calls = None
+        # Whether document.activeElement is proven to belong to the Post button
+        # (or a semantic descendant) after focus.
+        self.active_element_inside = True
+        # Whether pressing Enter semantically activates Post (produces X success).
+        self.enter_activates = True
+        # Whether an Enter activation surfaces the explicit X success signal.
+        self.enter_success = True
+        # Optionally surface a generic X problem alongside Enter-derived success.
+        self.enter_problem = False
+        # A generic X problem that only becomes visible after a keyboard
+        # activation (used to simulate Enter producing an error response).
+        self.keyboard_problem = None
 
     def all_elements(self):
         return [self.body, *self.body.descendants()]
@@ -329,6 +383,8 @@ class Page:
         if self.problem_text and (not self.problem_on_click or self.problem_active):
             if self.problem_after_seconds is None or self.elapsed >= self.problem_after_seconds:
                 text += "\n" + self.problem_text
+        if self.keyboard_problem and self.enter_count > 0:
+            text += "\n" + self.keyboard_problem
         return text
 
     def wait_for_timeout(self, milliseconds):
@@ -540,7 +596,7 @@ def test_c_click_has_short_dedicated_timeout_not_readiness_budget(media):
     assert result == {"ok": False, "reason": "post_button_click_timeout"}
     assert elements["active_post"].click_count == 1
     assert page.click_timeouts == [15000]
-    # 4s readiness + 5s reconciliation — a far cry from the 180s readiness
+    # 4s readiness + 5s reconciliation â€” a far cry from the 180s readiness
     # deadline that the click used to inherit.
     assert page.elapsed == pytest.approx(9.0)
     assert page.elapsed < 30
@@ -892,7 +948,6 @@ def test_h_no_success_inference_before_click_attempt(media):
     assert result["reason"] != "posted"
     assert elements["active_post"].click_count == 0
 
-
 def test_i_error_before_success_terminates_reconciliation(media):
     """Pinned policy: during reconciliation a generic X problem observed
     without the positive confirmation immediately fails the post. The success
@@ -910,3 +965,297 @@ def test_i_error_before_success_terminates_reconciliation(media):
     assert result == {"ok": False, "reason": "error"}
     assert elements["active_post"].click_count == 1
     assert page.elapsed < 1.0
+
+
+# -------------------------------------------------- guarded keyboard fallback
+#
+# These tests pin the safe-keyboard-activation repair. The mouse click remains
+# the primary Post action; the keyboard Enter fallback is used ONLY when the
+# click was proven to be blocked by a transparent overlay (pointer-interception
+# exception text + button-center hit test outside the button), the existing 5s
+# reconciliation saw no positive success, fresh post state revalidates, focus
+# ownership is proven, and exactly one Enter is sent.
+
+
+def _overlay():
+    return node(
+        "div.overlay",
+        tag="div",
+        text="overlay",
+        attrs={"role": "dialog", "data-testid": "layover", "class": "layover"},
+    )
+
+
+def test_classifier_pointer_intercepted():
+    exc = PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR)
+    assert (
+        XSession._classify_post_click_timeout(exc, {"inside_post_button": False})
+        == TIMEOUT_CLASS_POINTER_INTERCEPTED
+    )
+
+
+def test_classifier_requires_hit_test_outside_button():
+    exc = PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR)
+    assert (
+        XSession._classify_post_click_timeout(exc, {"inside_post_button": None})
+        == TIMEOUT_CLASS_UNKNOWN
+    )
+    assert (
+        XSession._classify_post_click_timeout(exc, {"inside_post_button": True})
+        == TIMEOUT_CLASS_UNKNOWN
+    )
+
+
+def test_classifier_generic_timeout_is_not_pointer_interception():
+    exc = PlaywrightTimeoutError("element is not stable")
+    assert (
+        XSession._classify_post_click_timeout(exc, {"inside_post_button": False})
+        == TIMEOUT_CLASS_UNSTABLE
+    )
+
+
+def test_classifier_detached_is_not_pointer_interception():
+    exc = PlaywrightTimeoutError("element got detached from the DOM")
+    assert XSession._classify_post_click_timeout(exc, {}) == TIMEOUT_CLASS_DETACHED
+
+
+def test_classifier_context_closed_is_not_pointer_interception():
+    exc = PlaywrightTimeoutError("Target page, context or browser has been closed")
+    assert (
+        XSession._classify_post_click_timeout(exc, {})
+        == TIMEOUT_CLASS_CONTEXT_CLOSED
+    )
+
+
+def test_p_keyboard_fallback_exact_production_shape(media, caplog):
+    """The critical regression: enabled+stable Post button, pointer-intercepted
+    mouse click, no success during reconciliation, fresh state valid, focus
+    verified, exactly one Enter, then explicit X success."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert elements["active_post"].click_count == 1  # one mouse attempt
+    assert page.enter_count == 1  # exactly one keyboard activation
+    assert page.focus_calls, "Post button was never focused"
+    assert "blocked by verified pointer interception" in caplog.text
+
+
+def test_e_mouse_timeout_but_posted_during_reconcile_no_enter(media, caplog):
+    """Mandatory duplicate-safety: the click timed out but X actually posted,
+    so the 5s reconciliation returns 'posted' and Enter is never used."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        sent_toast=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_f_success_and_error_during_reconcile_no_enter(media):
+    """Success precedence: during reconciliation a positive confirmation plus a
+    generic problem still resolves to posted with zero keyboard activation."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        sent_toast=True,
+        problem_text="Something went wrong",
+        problem_on_click=True,
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_b_generic_timeout_never_keyboard_fallback(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError("element is not stable"),
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "post_button_click_timeout"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_c_detached_timeout_never_keyboard_fallback(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError("element got detached from the DOM"),
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "post_button_click_timeout"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_d_context_closed_timeout_never_keyboard_fallback(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(
+            "Target page, context or browser has been closed"
+        ),
+    )
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "post_button_click_timeout"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_o_focus_failure_blocks_enter(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+    page.active_element_inside = False  # focus landed elsewhere
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "post_button_keyboard_focus_failed"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_q_enter_sent_but_no_success_not_posted(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+    page.enter_activates = False  # Enter does not produce X success
+
+    result = post(page, media)
+
+    assert result["ok"] is False
+    assert result["reason"] != "posted"
+    assert page.enter_count == 1
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 1  # no second activation after Enter
+
+
+def test_r_enter_generic_error_only_is_failure(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+    page.enter_success = False
+    page.keyboard_problem = "Something went wrong"
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "error"}
+    assert page.enter_count == 1
+    assert elements["active_post"].click_count == 1
+
+
+def test_s_enter_success_and_error_coexist_is_posted(media):
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+    page.keyboard_problem = "Something went wrong"
+
+    result = post(page, media)
+
+    assert result == {"ok": True, "reason": "posted"}
+    assert page.enter_count == 1
+
+
+def test_t_overlay_disappeared_after_reconcile_no_keyboard(media):
+    """Section 12: the fresh hit test no longer proves interception (overlay
+    gone, hit now inside the button) -> do NOT switch to keyboard."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+    # First hit (at click time) proves interception; later hits (fresh) show the
+    # top element now belongs to the Post button.
+    page.element_from_point_flip_after_calls = 1
+
+    result = post(page, media)
+
+    assert result == {"ok": False, "reason": "post_button_click_timeout"}
+    assert elements["active_post"].click_count == 1
+    assert page.enter_count == 0
+
+
+def test_h_attachment_disappearance_blocks_posting(media):
+    """An active attachment that disappears blocks posting (no keyboard)."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+
+    def remove_attachment():
+        elements["active_media"].visible = False
+
+    page.rerender_fn = remove_attachment
+
+    result = post(page, media)
+
+    assert page.enter_count == 0
+    assert result["ok"] is False
+
+
+def test_j_post_disabled_blocks_posting(media):
+    """If the Post button becomes disabled before posting, no keyboard."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+    )
+
+    def disable_post():
+        elements["active_post"].enabled = False
+
+    page.rerender_fn = disable_post
+
+    result = post(page, media)
+
+    assert page.enter_count == 0
+    assert result["ok"] is False
+
+
+def test_k_captcha_before_posting_blocks_keyboard(media):
+    """A captcha/login problem before posting stops it with no keyboard."""
+    page, elements = build_page(
+        active_button_selector=POST_MODAL,
+        element_from_point=_overlay(),
+        post_click_error=PlaywrightTimeoutError(CLICK_TIMEOUT_ERROR),
+        problem_text="verify your identity",
+    )
+
+    result = post(page, media)
+
+    assert page.enter_count == 0
+    assert result == {"ok": False, "reason": "captcha"}
+
